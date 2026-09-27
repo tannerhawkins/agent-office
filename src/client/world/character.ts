@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { HAIR_COLORS, HAIR_STYLES, SKIN_TONES, type Look } from '../../shared/avatar';
-import type { WorkerTask } from '../../shared/protocol';
+import type { WorkerStatus, WorkerTask } from '../../shared/protocol';
+import { isAsleep } from '../../shared/status';
+import { HIPS } from '../player';
 import { cardSprite, disposeSprite, mesh, textSprite, toon, toonUnique } from './toon';
 
 export type Pose = 'stand' | 'walk' | 'sit' | 'type';
@@ -19,6 +21,121 @@ export function reachCurve(p: number): number {
   const u = (p - 0.5) / 0.5;
   return 1 - u * u * (3 - 2 * u);
 }
+
+/** A full mug of coffee standing on y = 0, with its handle on the -x side. */
+export function coffeeMug(scale = 1): THREE.Group {
+  const mug = new THREE.Group();
+  const r = 0.05 * scale;
+  const height = 0.1 * scale;
+  const china = toon('#fffaf3');
+  mug.add(mesh(new THREE.CylinderGeometry(r, r * 0.88, height, 16), china, 0, height / 2, 0, false));
+  mug.add(mesh(new THREE.CylinderGeometry(r * 0.8, r * 0.8, height * 0.04, 16), toon('#6f4518'), 0, height, 0, false));
+  mug.add(mesh(new THREE.TorusGeometry(height * 0.28, r * 0.2, 6, 12), china, -r, height / 2, 0, false));
+  return mug;
+}
+
+/** On a smoke break, one drag every this many seconds. */
+export const SMOKE_CYCLE = 6;
+/** When, in a smoke cycle, the smoke is blown out. */
+export const EXHALE_AT = 2.5;
+
+/** How far the cigarette hand is up at the mouth (0..1), `c` seconds into a smoke cycle. */
+export function dragCurve(c: number): number {
+  const ease = (x: number) => x * x * (3 - 2 * x);
+  if (c < 0.7) return ease(c / 0.7);
+  if (c < 1.7) return 1;
+  if (c < 2.3) return 1 - ease((c - 1.7) / 0.6);
+  return 0;
+}
+
+/** A cigarette, lit end toward +z, and the material of its glowing tip. */
+export function cigarette(): { group: THREE.Group; ember: THREE.MeshToonMaterial } {
+  const group = new THREE.Group();
+  group.add(mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.12, 8).rotateX(Math.PI / 2), toon('#fffaf3'), 0, 0, 0.01, false));
+  group.add(mesh(new THREE.CylinderGeometry(0.017, 0.017, 0.045, 8).rotateX(Math.PI / 2), toon('#e9a03b'), 0, 0, -0.07, false));
+  const ember = toonUnique('#ff6a2b');
+  ember.emissive = new THREE.Color('#ff3b00');
+  ember.emissiveIntensity = 0.3;
+  group.add(mesh(new THREE.CylinderGeometry(0.017, 0.017, 0.02, 8).rotateX(Math.PI / 2), ember, 0, 0, 0.078, false));
+  return { group, ember };
+}
+
+/**
+ * An open cardboard box with someone's desk things in it: a plant, a photo, a mug, a rubber duck and
+ * some papers. It stands on y = 0 with its front toward +z.
+ */
+export function boxOfStuff(): THREE.Group {
+  const g = new THREE.Group();
+  const W = 0.52;
+  const H = 0.26;
+  const D = 0.3;
+  const T = 0.02;
+  const card = toon('#c8955c');
+  g.add(mesh(new THREE.BoxGeometry(W, T, D), card, 0, T / 2, 0));
+  for (const s of [-1, 1]) {
+    g.add(mesh(new THREE.BoxGeometry(W, H, T), card, 0, H / 2, s * (D - T) / 2));
+    g.add(mesh(new THREE.BoxGeometry(T, H, D - 2 * T), card, s * (W - T) / 2, H / 2, 0));
+  }
+  // Full to the brim.
+  g.add(mesh(new THREE.BoxGeometry(W - 2 * T, 0.01, D - 2 * T), toon('#8b6a47'), 0, H * 0.7, 0, false));
+  // Flaps: the front one hangs down over the front, the side ones stick up and out.
+  const flapMat = toon('#b5824c');
+  const front = new THREE.Group();
+  front.position.set(0, H, D / 2);
+  front.rotation.x = 1.2;
+  front.add(mesh(new THREE.BoxGeometry(W, T, 0.14), flapMat, 0, 0, 0.07));
+  g.add(front);
+  for (const s of [-1, 1]) {
+    const flap = new THREE.Group();
+    flap.position.set((s * W) / 2, H, 0);
+    flap.rotation.z = s * 0.95;
+    flap.add(mesh(new THREE.BoxGeometry(0.13, T, D), flapMat, s * 0.065, 0, 0));
+    g.add(flap);
+  }
+
+  // A potted plant in the back corner.
+  g.add(mesh(new THREE.CylinderGeometry(0.06, 0.045, 0.11, 10), toon('#e76f51'), -0.15, H - 0.03, -0.04, false));
+  for (const [x, y, z, r, c] of [
+    [-0.15, 0.1, -0.04, 0.07, '#5fb760'],
+    [-0.2, 0.07, 0.0, 0.05, '#3f8f45'],
+    [-0.11, 0.15, -0.07, 0.05, '#6fcf6a'],
+  ] as const)
+    g.add(mesh(new THREE.SphereGeometry(r, 10, 8), toon(c), x, H + y, z, false));
+  // Papers sticking up at the back.
+  for (const [x, rz] of [
+    [-0.01, 0.16],
+    [0.05, -0.1],
+  ]) {
+    const paper = mesh(new THREE.BoxGeometry(0.17, 0.22, 0.004), toon('#fffaf3'), x, H - 0.01, -0.1, false);
+    paper.rotation.set(-0.1, 0, rz);
+    g.add(paper);
+  }
+  // A framed photo, leaning back.
+  const photo = new THREE.Group();
+  photo.add(mesh(new THREE.BoxGeometry(0.16, 0.13, 0.02), toon('#2b2d42'), 0, 0, 0, false));
+  photo.add(mesh(new THREE.BoxGeometry(0.12, 0.09, 0.005), toon('#8ecae6'), 0, 0, 0.011, false));
+  photo.add(mesh(new THREE.SphereGeometry(0.018, 8, 6), toon('#ffd166'), 0.03, 0.02, 0.014, false));
+  photo.position.set(0.1, H + 0.04, -0.05);
+  photo.rotation.set(-0.3, 0, -0.12);
+  g.add(photo);
+  // A mug and the rubber duck, up front.
+  const mug = coffeeMug(0.9);
+  mug.position.set(0.0, H - 0.07, 0.07);
+  g.add(mug);
+  const duck = new THREE.Group();
+  const duckBody = mesh(new THREE.SphereGeometry(0.05, 10, 8), toon('#ffd166'), 0, 0, 0, false);
+  duckBody.scale.y = 0.8;
+  duck.add(duckBody);
+  duck.add(mesh(new THREE.SphereGeometry(0.032, 10, 8), toon('#ffd166'), 0, 0.055, 0.02, false));
+  duck.add(mesh(new THREE.ConeGeometry(0.014, 0.03, 6).rotateX(Math.PI / 2), toon('#f4a261'), 0, 0.05, 0.06, false));
+  duck.position.set(0.16, H + 0.01, 0.06);
+  duck.rotation.y = -0.4;
+  g.add(duck);
+  return g;
+}
+
+const v1 = new THREE.Vector3();
+const v2 = new THREE.Vector3();
 
 /** A chibi cartoon person — used for every human in the office. Forward is +z. */
 export class Person {
@@ -46,7 +163,22 @@ export class Person {
   private talkUntil = 0;
   private walkPhase = 0;
   private reachT = -1;
+  /** Held in the left hand, kept upright however the arm swings. */
+  private mug = new THREE.Group();
   pose: Pose = 'stand';
+  private cig: THREE.Group;
+  private ember: THREE.MeshToonMaterial;
+  /** Seconds into a smoke break, or -1 when not on one. */
+  private smokeT = -1;
+  private wispIn = 0;
+  /** Where smoke comes off: the lit end (a wisp) or the mouth, blowing it out along `dir`. */
+  onSmoke: ((kind: 'wisp' | 'exhale', at: THREE.Vector3, dir: THREE.Vector3) => void) | null = null;
+  /** Hips this high above the feet while sitting (on the seat), or null on their feet. */
+  private hips: number | null = null;
+  /** The last seat's, so getting up eases back down from it. */
+  private seatHips = HIPS;
+  /** 0 standing … 1 sitting, eased between so sitting down and getting up take a moment. */
+  private sitK = 0;
 
   constructor(
     private name: string,
@@ -93,11 +225,29 @@ export class Person {
       this.body.add(pivot);
       return pivot;
     };
-    this.legL = limb(0.22, 0.1, pants, -0.12, 0.42);
-    this.legR = limb(0.22, 0.1, pants, 0.12, 0.42);
+    this.legL = limb(0.22, 0.1, pants, -0.12, HIPS);
+    this.legR = limb(0.22, 0.1, pants, 0.12, HIPS);
     this.armL = limb(0.24, 0.08, this.shirt, -0.33, 0.9);
     this.armR = limb(0.24, 0.08, this.shirt, 0.33, 0.9);
     for (const arm of [this.armL, this.armR]) arm.add(mesh(new THREE.SphereGeometry(0.085, 12, 10), skin, 0, -0.38, 0));
+    // Forward is +z, so the character's left arm is the one on +x. The handle faces the hand.
+    const cup = coffeeMug(1.4);
+    cup.position.set(0.02, -0.08, 0.1);
+    cup.rotation.y = -Math.PI / 2;
+    this.mug.add(cup);
+    this.mug.position.set(0, -0.38, 0);
+    this.mug.visible = false;
+    this.armR.add(this.mug);
+    // For smoke breaks: a cigarette sticking out of the right fist (the arm on -x, see reach), lit end
+    // pointing down at your side and up and away when it's at your mouth.
+    const cig = cigarette();
+    this.cig = cig.group;
+    this.ember = cig.ember;
+    const along = new THREE.Vector3(0, -0.9, -0.44).normalize();
+    this.cig.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), along);
+    this.cig.position.set(0, -0.38, 0).addScaledVector(along, 0.07);
+    this.cig.visible = false;
+    this.armL.add(this.cig);
 
     // Little mic icon that pops up while speaking
     this.mic = mesh(new THREE.SphereGeometry(0.09, 10, 8), toon('#7cf29a', { emissive: '#2a9d4b' }), 0, 2.25, 0, false);
@@ -220,9 +370,60 @@ export class Person {
     this.reachT = 0;
   }
 
-  update(dt: number, t: number, moving: boolean, airborne: boolean) {
+  /** A mug of coffee in the left hand, or not. */
+  holdMug(on: boolean) {
+    this.mug.visible = on;
+  }
+
+  get smoking(): boolean {
+    return this.smokeT >= 0;
+  }
+
+  /** Lights a cigarette (or puts it out): it's in their right hand, and they take a drag every few seconds. */
+  setSmoking(on: boolean) {
+    if (on === this.smoking) return;
+    this.smokeT = on ? 0 : -1;
+    this.cig.visible = on;
+  }
+
+  /** A drag: up to the mouth, hold while the tip glows, back down, then blow the smoke out. */
+  private smokeStep(dt: number, walking: boolean, airborne: boolean) {
+    const prev = this.smokeT % SMOKE_CYCLE;
+    this.smokeT += dt;
+    const c = this.smokeT % SMOKE_CYCLE;
+    const k = walking || airborne ? 0 : dragCurve(c);
+    if (!airborne) {
+      this.armL.rotation.x = THREE.MathUtils.lerp(-0.9, -2.6, k);
+      this.armL.rotation.z = THREE.MathUtils.lerp(0.15, 0.6, k);
+    }
+    const glow = k > 0.9 ? 1.4 : 0.3;
+    this.ember.emissiveIntensity += (glow - this.ember.emissiveIntensity) * Math.min(1, dt * 6);
+    if (!this.onSmoke) return;
+    this.wispIn -= dt;
+    const exhale = prev < EXHALE_AT && c >= EXHALE_AT;
+    if (this.wispIn > 0 && !exhale) return;
+    this.root.updateMatrixWorld(true);
+    if (this.wispIn <= 0) {
+      this.wispIn = 0.16 + Math.random() * 0.12;
+      this.onSmoke('wisp', this.cig.localToWorld(v1.set(0, 0, 0.09)), v2.set(0, 1, 0));
+    }
+    if (exhale) {
+      const dir = v2.set(0, 0.25, 1).applyQuaternion(this.root.quaternion).normalize();
+      this.onSmoke('exhale', this.head.localToWorld(v1.set(0, -0.1, 0.36)), dir);
+    }
+  }
+
+  /** Sits down with the hips `hips` above the feet, on a couch or a chair, or gets up (null). */
+  sit(hips: number | null) {
+    this.hips = hips;
+    if (hips !== null) this.seatHips = hips;
+    this.pose = hips === null ? 'stand' : 'sit';
+  }
+
+  /** `pace` speeds up the walk cycle for someone walking faster than usual. */
+  update(dt: number, t: number, moving: boolean, airborne: boolean, pace = 1) {
     const target = moving ? 1 : 0;
-    this.walkPhase += dt * 11 * target;
+    this.walkPhase += dt * 11 * target * pace;
     const swing = Math.sin(this.walkPhase) * 0.7 * target;
     if (airborne) {
       this.legL.rotation.x = -0.5;
@@ -238,6 +439,14 @@ export class Person {
       this.armL.rotation.z = THREE.MathUtils.lerp(this.armL.rotation.z, -0.1, 0.3);
       this.armR.rotation.z = THREE.MathUtils.lerp(this.armR.rotation.z, 0.1, 0.3);
     }
+    this.sitK += ((this.hips === null ? 0 : 1) - this.sitK) * Math.min(1, dt * 10);
+    const sit = this.sitK > 0.001 ? this.sitK : 0;
+    if (sit) {
+      // Legs out over the edge of the seat, hands in the lap (a cigarette still comes up for a drag).
+      for (const leg of [this.legL, this.legR]) leg.rotation.x = THREE.MathUtils.lerp(leg.rotation.x, -1.35, sit);
+      for (const arm of [this.armL, this.armR]) arm.rotation.x = THREE.MathUtils.lerp(arm.rotation.x, -0.55, sit);
+    }
+    if (this.smokeT >= 0) this.smokeStep(dt, moving, airborne);
     let reach = 0;
     if (this.reachT >= 0) {
       this.reachT += dt;
@@ -249,7 +458,10 @@ export class Person {
     }
     // Lean into the reach a little.
     this.body.rotation.x = reach * 0.12;
+    if (this.mug.visible) this.mug.quaternion.copy(this.armR.quaternion).invert();
     this.body.position.y = moving && !airborne ? Math.abs(Math.sin(this.walkPhase)) * 0.06 : 0;
+    // Down onto (or up onto) the seat: the hips go where it puts them.
+    if (sit) this.body.position.y = THREE.MathUtils.lerp(this.body.position.y, this.seatHips - HIPS, sit);
     if (this.speaking) this.mic.scale.setScalar(1 + Math.sin(t * 14) * 0.2);
 
     // Lip flap: pop open fast on each syllable, close a little slower.
@@ -287,35 +499,7 @@ const TASK_CHIP: Record<string, [string, string, string]> = {
   offline: ['💤 ASLEEP', STATUS_BULB.offline, '#ffffff'],
 };
 
-/** The mark pinned on a worker's chest that says which agent it runs. */
-export interface WorkerBadge {
-  text: string;
-  color: string;
-}
-
-/** A round pin with a short mark on it, as a texture. */
-function badgeTexture(b: WorkerBadge): THREE.CanvasTexture {
-  const c = document.createElement('canvas');
-  c.width = c.height = 128;
-  const g = c.getContext('2d')!;
-  g.beginPath();
-  g.arc(64, 64, 58, 0, Math.PI * 2);
-  g.fillStyle = b.color;
-  g.fill();
-  g.lineWidth = 10;
-  g.strokeStyle = '#fffaf3';
-  g.stroke();
-  g.fillStyle = '#fffaf3';
-  g.font = `900 ${b.text.length > 1 ? 50 : 64}px system-ui, sans-serif`;
-  g.textAlign = 'center';
-  g.textBaseline = 'middle';
-  g.fillText(b.text, 64, 68);
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  return t;
-}
-
-/** The little worker that sits at a desk. Forward is +z. */
+/** The little Claude worker that sits at a desk. Forward is +z. */
 export class Worker {
   readonly root = new THREE.Group();
   private body = new THREE.Group();
@@ -331,16 +515,22 @@ export class Worker {
   private nameTag: THREE.Sprite | null = null;
   private eyes: THREE.Mesh[] = [];
   private blinkAt = Math.random() * 4;
-  status = 'starting';
+  status: WorkerStatus = 'starting';
   bouncing = false;
+  /** You're close enough to read its card: it lands the hop it's in and stands still until you walk away. */
+  held = false;
   private bounceT = 0;
   private spawnT = 0;
-  private badge: { tex: THREE.CanvasTexture; mat: THREE.MeshBasicMaterial; geo: THREE.CircleGeometry } | null = null;
-  /** Name tag colour: the agent's, so a Claude worker and a Cursor one differ from across the room. */
-  private tagBg = '#2b2d42';
+  /** Seconds left jumping for joy (its pull request just merged). */
+  private cheerT = 0;
+  private pupils: THREE.Mesh[] = [];
+  private feet: THREE.Mesh[] = [];
+  /** Sent home: the box of its things in its arms, and how far into its waddle it is. */
+  private leaving: { box: THREE.Group; boxT: number; stride: number } | null = null;
+  /** Sent home and on its way out: it waddles along instead of standing. */
+  walking = false;
 
-  constructor(name: string, color: string, badge?: WorkerBadge) {
-    if (badge) this.tagBg = badge.color;
+  constructor(name: string, color: string) {
     const skin = toonUnique(color);
     const white = toon('#ffffff');
     const ink = toon('#1d1d1d');
@@ -357,6 +547,7 @@ export class Worker {
       const pupil = mesh(new THREE.SphereGeometry(0.045, 10, 8), ink, sx * 0.11, 0.7, 0.29, false);
       this.body.add(pupil);
       this.eyes.push(eye, pupil);
+      this.pupils.push(pupil);
     }
     // Headset: band + mic
     const band = mesh(new THREE.TorusGeometry(0.29, 0.025, 6, 20, Math.PI), toon('#2b2d42'), 0, 0.72, 0, false);
@@ -379,17 +570,10 @@ export class Worker {
     };
     this.armL = arm(-0.3);
     this.armR = arm(0.3);
-    for (const sx of [-1, 1]) this.body.add(mesh(new THREE.CapsuleGeometry(0.06, 0.1, 4, 8), skin, sx * 0.12, 0.2, 0.05));
-    // Agent pin on the chest, like a name badge
-    if (badge) {
-      const tex = badgeTexture(badge);
-      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
-      const geo = new THREE.CircleGeometry(0.075, 24);
-      const pin = new THREE.Mesh(geo, mat);
-      pin.position.set(0.13, 0.47, 0.262);
-      pin.rotation.y = 0.45;
-      this.body.add(pin);
-      this.badge = { tex, mat, geo };
+    for (const sx of [-1, 1]) {
+      const foot = mesh(new THREE.CapsuleGeometry(0.06, 0.1, 4, 8), skin, sx * 0.12, 0.2, 0.05);
+      this.body.add(foot);
+      this.feet.push(foot);
     }
 
     this.setName(name);
@@ -400,12 +584,12 @@ export class Worker {
       this.root.remove(this.nameTag);
       disposeSprite(this.nameTag);
     }
-    this.nameTag = textSprite(name, { bg: this.tagBg, color: '#fffaf3', size: 36, border: '#fffaf3' });
+    this.nameTag = textSprite(name, { bg: '#2b2d42', color: '#fffaf3', size: 36, border: '#fffaf3' });
     this.nameTag.position.y = 1.55;
     this.root.add(this.nameTag);
   }
 
-  setStatus(status: string, bounce: boolean) {
+  setStatus(status: WorkerStatus, bounce: boolean) {
     this.status = status;
     this.bouncing = bounce;
     const c = STATUS_BULB[status] ?? '#adb5bd';
@@ -414,18 +598,55 @@ export class Worker {
     this.drawBubble();
   }
 
+  /** Jumps for joy, arms up, for a few seconds. */
+  cheer(seconds = 3) {
+    this.cheerT = seconds;
+  }
+
   /** What it's working on, shown on a card over its head in place of the status bubble. */
   setTask(task: WorkerTask | undefined) {
     this.task = task;
     this.drawBubble();
   }
 
+  /** Sent home: its light goes out, its face falls, and its things pop into a box in its arms. `farewell` goes over its head. */
+  leave(farewell: string) {
+    if (this.leaving) return;
+    this.bouncing = false;
+    this.cheerT = 0;
+    this.bounceT = 0;
+    this.bulb.color.set(STATUS_BULB.exited);
+    this.bulb.emissive.set('#000000');
+    if (this.bubble) {
+      this.root.remove(this.bubble);
+      disposeSprite(this.bubble);
+    }
+    this.bubbleKey = 'leaving';
+    this.bubbleIsCard = false;
+    this.bubble = textSprite(farewell, { bg: '#e9ecef', size: 34 });
+    this.root.add(this.bubble);
+    // Looking down, brows up in the middle.
+    for (const p of this.pupils) p.position.y -= 0.035;
+    for (const sx of [-1, 1]) {
+      const brow = mesh(new THREE.CapsuleGeometry(0.014, 0.08, 4, 6), toon('#1d1d1d'), sx * 0.11, 0.83, 0.228, false);
+      brow.rotation.z = Math.PI / 2 - sx * 0.4;
+      this.body.add(brow);
+    }
+    // Hugged to its belly, the arms round the sides.
+    const box = boxOfStuff();
+    box.position.set(0, 0.22, 0.33);
+    box.scale.setScalar(0.001);
+    this.body.add(box);
+    this.leaving = { box, boxT: 0, stride: 0 };
+  }
+
   private drawBubble() {
+    if (this.leaving) return;
     const { status, bouncing: bounce, task } = this;
     const hot = status === 'needs_input' || (status === 'done' && bounce);
     const bg = hot ? (status === 'done' ? '#caffbf' : '#ffd6e0') : status === 'working' ? '#ffec99' : '#fffaf3';
     const bubble =
-      status === 'needs_input' ? '❗ needs you' : status === 'done' && bounce ? '✅ done!' : status === 'working' ? '⌨️ working' : status === 'offline' || status === 'exited' ? '💤' : '';
+      status === 'needs_input' ? '❗ needs you' : status === 'done' && bounce ? '✅ done!' : status === 'working' ? '⌨️ working' : isAsleep(status) ? '💤' : '';
     const key = task ? `${status}|${bounce}|${task.name}|${task.summary}` : bubble;
     if (key === this.bubbleKey) return;
     this.bubbleKey = key;
@@ -437,14 +658,22 @@ export class Worker {
     this.bubbleIsCard = !!task;
     if (task) {
       const [text, chipBg, color] = TASK_CHIP[status] ?? TASK_CHIP.idle;
-      const asleep = status === 'offline' || status === 'exited';
-      this.bubble = cardSprite({ chip: { text, bg: chipBg, color }, title: task.name, body: task.summary, bg: asleep ? '#e9ecef' : bg });
+      this.bubble = cardSprite({ chip: { text, bg: chipBg, color }, title: task.name, body: task.summary, bg: isAsleep(status) ? '#e9ecef' : bg });
     } else if (bubble) this.bubble = textSprite(bubble, { bg, size: 38 });
     if (this.bubble) this.root.add(this.bubble);
   }
 
   update(dt: number, t: number) {
-    const working = this.status === 'working';
+    if (this.leaving) return this.carry(this.leaving, dt, t);
+    this.cheerT = Math.max(0, this.cheerT - dt);
+    // Jump up and down when done / waiting on a human (except while held), or cheering.
+    if (this.bouncing || this.cheerT > 0) {
+      const landAt = Math.ceil(this.bounceT / Math.PI) * Math.PI;
+      this.bounceT += dt * 7;
+      if (this.held && !this.cheerT && this.bounceT >= landAt) this.bounceT = 0;
+    } else this.bounceT = 0;
+    const hopping = this.bounceT > 0;
+    const working = this.status === 'working' && !hopping;
     // Pop-in when hired
     this.spawnT = Math.min(1, this.spawnT + dt * 2.5);
     const pop = this.spawnT < 1 ? 1 + Math.sin(this.spawnT * Math.PI) * 0.35 : 1;
@@ -453,42 +682,65 @@ export class Worker {
       this.armL.rotation.x = -1.2 + Math.sin(t * 22) * 0.25;
       this.armR.rotation.x = -1.2 + Math.sin(t * 22 + 1.7) * 0.25;
     } else {
-      this.armL.rotation.x = THREE.MathUtils.lerp(this.armL.rotation.x, this.bouncing ? -2.6 : -0.3, 0.2);
-      this.armR.rotation.x = THREE.MathUtils.lerp(this.armR.rotation.x, this.bouncing ? -2.6 : -0.3, 0.2);
+      this.armL.rotation.x = THREE.MathUtils.lerp(this.armL.rotation.x, hopping || this.bouncing ? -2.6 : -0.3, 0.2);
+      this.armR.rotation.x = THREE.MathUtils.lerp(this.armR.rotation.x, hopping || this.bouncing ? -2.6 : -0.3, 0.2);
     }
-    // Jump up and down when done / waiting on a human
-    if (this.bouncing) {
-      this.bounceT += dt * 7;
+    if (hopping) {
       const s = Math.abs(Math.sin(this.bounceT));
       this.body.position.y = s * 0.55;
       const squash = s < 0.15 ? 1 - (0.15 - s) * 1.6 : 1;
       this.body.scale.set(pop * (2 - squash), pop * squash, pop * (2 - squash));
       this.body.rotation.y = Math.sin(this.bounceT * 0.5) * 0.3;
     } else {
-      this.bounceT = 0;
       this.body.position.y = working ? Math.abs(Math.sin(t * 11)) * 0.02 : Math.sin(t * 2) * 0.015;
       this.body.scale.setScalar(pop);
       this.body.rotation.y = THREE.MathUtils.lerp(this.body.rotation.y, 0, 0.1);
     }
-    // Blink
+    this.blink(dt);
+    this.bulbMesh.scale.setScalar(this.status === 'needs_input' ? 1 + Math.abs(Math.sin(t * 8)) * 0.5 : 1);
+    if (isAsleep(this.status)) this.body.rotation.z = Math.sin(t * 1.5) * 0.08;
+    if (this.bubble) this.bubble.position.y = (this.bubbleIsCard ? 1.74 : 1.95) + (hopping ? this.body.position.y : 0) + Math.sin(t * 3) * 0.03;
+    if (this.nameTag) this.nameTag.position.y = 1.55 + (hopping ? this.body.position.y : 0);
+  }
+
+  /** Sent home: head hung, the box in its arms, waddling along while `walking`. */
+  private carry(l: NonNullable<Worker['leaving']>, dt: number, t: number) {
+    // The box pops in, overshooting a little.
+    l.boxT = Math.min(1, l.boxT + dt * 2.5);
+    const u = l.boxT - 1;
+    l.box.scale.setScalar(Math.max(0.001, 1 + 2.7 * u * u * u + 1.7 * u * u));
+    const k = Math.min(1, dt * 10);
+    this.armL.rotation.x += (-1 - this.armL.rotation.x) * k;
+    this.armR.rotation.x += (-1 - this.armR.rotation.x) * k;
+    this.armL.rotation.z += (0.12 - this.armL.rotation.z) * k;
+    this.armR.rotation.z += (-0.12 - this.armR.rotation.z) * k;
+    if (this.walking) l.stride += dt * 9;
+    const s = this.walking ? Math.sin(l.stride) : 0;
+    this.feet.forEach((f, i) => {
+      const step = i ? -s : s;
+      f.position.z = 0.05 + step * 0.08;
+      f.position.y = 0.2 + Math.max(0, step) * 0.05;
+    });
+    this.body.position.y = Math.abs(s) * 0.05;
+    this.body.rotation.z = s * 0.1;
+    this.body.rotation.x += (0.15 - this.body.rotation.x) * Math.min(1, dt * 4);
+    this.body.rotation.y += -this.body.rotation.y * k;
+    this.body.scale.setScalar(1);
+    this.bulbMesh.scale.setScalar(1);
+    this.blink(dt);
+    if (this.bubble) this.bubble.position.y = 1.95 + Math.sin(t * 3) * 0.03;
+    if (this.nameTag) this.nameTag.position.y = 1.55;
+  }
+
+  private blink(dt: number) {
     this.blinkAt -= dt;
     const blinking = this.blinkAt < 0.12 && this.blinkAt > 0;
     if (this.blinkAt < 0) this.blinkAt = 2 + Math.random() * 4;
     for (const e of this.eyes) e.scale.y = blinking ? 0.1 : 1;
-    const sleepy = this.status === 'offline' || this.status === 'exited';
-    this.bulbMesh.scale.setScalar(this.status === 'needs_input' ? 1 + Math.abs(Math.sin(t * 8)) * 0.5 : 1);
-    if (sleepy) this.body.rotation.z = Math.sin(t * 1.5) * 0.08;
-    if (this.bubble) this.bubble.position.y = (this.bubbleIsCard ? 1.74 : 1.95) + (this.bouncing ? this.body.position.y : 0) + Math.sin(t * 3) * 0.03;
-    if (this.nameTag) this.nameTag.position.y = 1.55 + (this.bouncing ? this.body.position.y : 0);
   }
 
   dispose() {
     if (this.bubble) disposeSprite(this.bubble);
     if (this.nameTag) disposeSprite(this.nameTag);
-    if (this.badge) {
-      this.badge.tex.dispose();
-      this.badge.mat.dispose();
-      this.badge.geo.dispose();
-    }
   }
 }

@@ -23,8 +23,6 @@ GH_TOKEN_ARG=""
 NO_GH_TOKEN=0
 CLAUDE_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 ANTHROPIC_KEY=""
-CURSOR=0
-CURSOR_KEY="${CURSOR_API_KEY:-}"
 YES=0
 NO_OPEN=0
 EXTRA_ALLOW=()
@@ -90,9 +88,6 @@ Options
                             (default: $CLAUDE_CODE_OAUTH_TOKEN). Without one, log in from the
                             first worker's terminal in the office.
   --anthropic-api-key <key> Use an Anthropic API key instead
-  --cursor                  Also install Cursor's CLI, so workers can run Cursor too
-  --cursor-api-key <key>    Cursor API key for it (default: $CURSOR_API_KEY; implies --cursor).
-                            Without one, log in from the first Cursor worker's terminal.
   --no-open                 Don't open the browser (up, resume: don't open the tunnel either)
   -y, --yes                 Don't ask for confirmation
 EOF
@@ -125,8 +120,6 @@ while [[ $# -gt 0 ]]; do
     --no-github-token) NO_GH_TOKEN=1; shift ;;
     --claude-token) CLAUDE_TOKEN="$2"; shift 2 ;;
     --anthropic-api-key) ANTHROPIC_KEY="$2"; shift 2 ;;
-    --cursor) CURSOR=1; shift ;;
-    --cursor-api-key) CURSOR_KEY="$2"; CURSOR=1; shift 2 ;;
     --no-open) NO_OPEN=1; shift ;;
     -y | --yes) YES=1; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -454,11 +447,6 @@ cmd_up() {
   else
     echo "   claude:   not signed in — log in from the first worker's terminal (or pass --claude-token)"
   fi
-  if [[ -n "$CURSOR_KEY" ]]; then
-    echo "   cursor:   installed, signed in with the API key you provided"
-  elif [[ "$CURSOR" == 1 ]]; then
-    echo "   cursor:   installed — log in from the first Cursor worker's terminal (or pass --cursor-api-key)"
-  fi
 
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
@@ -542,7 +530,6 @@ cmd_up() {
     printf 'export APP_REPO=%q APP_REF=%q PROJECT_REPO=%q PROJECT_NAME=%q\n' "$APP_REPO" "$APP_REF" "$project_repo" "$project_name"
     printf 'export CLAIM_TOKEN=%q PUBLIC_HOST=%q GH_TOKEN=%q CLAUDE_CODE_OAUTH_TOKEN=%q ANTHROPIC_API_KEY=%q\n' "$(cat "$CLAIM_FILE")" "$IP" "$gh_token" "$CLAUDE_TOKEN" "$ANTHROPIC_KEY"
     printf 'export GIT_NAME=%q GIT_EMAIL=%q\n' "$git_name" "$git_email"
-    printf 'export INSTALL_CURSOR=%q CURSOR_API_KEY=%q\n' "$CURSOR" "$CURSOR_KEY"
     cat "$SCRIPT_DIR/provision.sh"
   } | remote 'bash -s' || die "provisioning failed (re-run \"deploy/aws.sh up\" to retry; it picks up where it left off)"
 

@@ -2,6 +2,9 @@
 
 import type { Look } from './avatar.js';
 import type { DecorPlacement, Decoration } from './decor.js';
+import type { DogState } from './dog.js';
+import type { JukeboxState } from './jukebox.js';
+import type { WbElement, WbPointer, WhiteboardView } from './whiteboard.js';
 
 export type WorkerStatus =
   | 'starting' // PTY launched, agent booting
@@ -14,22 +17,10 @@ export type WorkerStatus =
 
 export type WorkerKind = 'agent' | 'shell';
 
-/** Which coding agent a worker runs: Claude Code, Cursor's CLI, or whatever `--agent` named. */
-export type AgentId = 'claude' | 'cursor' | 'custom';
-export const AGENT_IDS: readonly AgentId[] = ['claude', 'cursor', 'custom'];
-export const isAgentId = (v: unknown): v is AgentId => typeof v === 'string' && (AGENT_IDS as readonly string[]).includes(v);
+export type AgentProvider = 'claude' | 'opencode' | 'codex' | 'custom';
 
-/** An agent the office can seat, as the hire dialogs offer it. */
-export interface AgentOption {
-  id: AgentId;
-  label: string;
-  /** Short mark for badges ("C", "Cu"). */
-  badge: string;
-  badgeColor: string;
-  /** Its command line, as the office runs it. */
-  cmd: string;
-  /** Found on the office machine. */
-  available: boolean;
+export function isAgentProvider(value: unknown): value is AgentProvider {
+  return value === 'claude' || value === 'opencode' || value === 'codex' || value === 'custom';
 }
 
 /** What a worker is on, for the card above its head: "Fix Login Redirect" + what it's doing now. */
@@ -40,10 +31,11 @@ export interface WorkerTask {
 
 export interface WorkerInfo {
   id: string;
-  /** 'agent' runs a coding agent (see `agent`); 'shell' is a plain shared login shell. */
+  /** 'agent' runs the selected provider; 'shell' is a plain shared login shell. */
   kind: WorkerKind;
-  /** Which agent it runs (agents only; missing on old saves means Claude Code). */
-  agent?: AgentId;
+  provider?: AgentProvider;
+  /** Initial OpenCode model selected for this worker, when one was requested. */
+  model?: string;
   deskId: string;
   name: string;
   color: string;
@@ -73,15 +65,23 @@ export interface WorkerInfo {
   activity?: string;
   /** Written by a small model from its prompts and recent tool calls (see server/tasks.ts). */
   task?: WorkerTask;
-  /** Tokens and cost of its agent session so far, subagents included (agents only). */
+  /** Reported session tokens and cost, when the provider supplies them (agents only). */
   usage?: Usage;
+  /** Who last typed into its terminal (or sent it a prompt), and when. */
+  lastInput?: { by: string; at: number };
 }
 
-/** Tokens and what they cost, summed over an agent session or the whole office. */
+/** Session usage. The persistent office ledger continues to cover Claude Code only. */
 export interface Usage {
   /** Input tokens that missed the prompt cache. */
   input: number;
   output: number;
+  /** Reasoning tokens reported separately from output, when available. */
+  reasoning?: number;
+  /** False when the provider supplies tokens without usable pricing. Omitted for legacy Claude usage. */
+  costKnown?: boolean;
+  /** Provider history is still loading, failed to load, or reached a traversal limit. */
+  incomplete?: boolean;
   /** Tokens written to the prompt cache. */
   cacheWrite: number;
   /** Tokens read from the prompt cache. */
@@ -90,8 +90,10 @@ export interface Usage {
   cost: number;
   /** API calls (assistant messages) counted. */
   calls: number;
-  /** Some of the cost is a guess: Cursor reports tokens but not what they cost. */
-  estimated?: boolean;
+  /** False when the provider reports cumulative tokens without a reliable call count. */
+  callsKnown?: boolean;
+  /** Authoritative provider total when it cannot be reconstructed from the displayed buckets. */
+  totalTokens?: number;
 }
 
 /** Spend across the whole office, kept on disk (see server/usage.ts). */
@@ -106,6 +108,29 @@ export interface UsageState {
   budget?: number;
   /** New hires are refused for the rest of the day once the budget is spent (--budget-pause). */
   pauseHiring: boolean;
+}
+
+/** One of the Claude plan's usage windows: the 5-hour session, the week, or a model's week. */
+export interface PlanWindow {
+  /** e.g. "5h session", "Week", "Fable week". */
+  label: string;
+  /** Percent of the window used, 0-100. */
+  pct: number;
+  /** When it starts over (ms since epoch), when known. */
+  resetsAt?: number;
+}
+
+/**
+ * The Claude plan limits of the account the office's Claude workers run on, as Claude Code's
+ * /usage shows them (see server/limits.ts). One account for the whole building.
+ */
+export interface PlanLimits {
+  /** 'pro', 'max', 'team', 'enterprise'…, when known. */
+  plan?: string;
+  /** The 5-hour session first, then the week, then per-model weeks. Empty until first read, or when there is no plan. */
+  windows: PlanWindow[];
+  /** When the numbers were read (ms since epoch); 0 before the first read. */
+  at: number;
 }
 
 /** What becomes of a worker's git worktree when it is sent home. */
@@ -139,6 +164,14 @@ export interface PeerInfo {
   voice: boolean;
   muted: boolean;
   sharing: boolean;
+  /** On a smoke break, cigarette in hand. */
+  smoking?: boolean;
+  /** Sitting down: the place they're in (see seatAt in layout), like "couch:1". */
+  seat?: string;
+  /** Signed in with their own account, so `name` is theirs and nobody else can take it. */
+  account?: boolean;
+  /** The floor they're on (see FloorInfo); none while the building has no floors yet. */
+  floor?: string;
 }
 
 /** A styled run of text on a terminal row: [text, fg, bg, flags]. */
@@ -189,6 +222,9 @@ export type TaskStatus = 'queued' | 'running' | 'done';
 /** A task on the 📋 queue whiteboard: a GitHub issue or free text, seated to a worker by itself. */
 export interface QueueTask {
   id: string;
+  provider?: AgentProvider;
+  /** Initial OpenCode model selected for this task, when one was requested. */
+  model?: string;
   /** The GitHub issue it came from, when it did. */
   issue?: number;
   title: string;
@@ -196,8 +232,6 @@ export interface QueueTask {
   addedBy: string;
   addedAt: number;
   status: TaskStatus;
-  /** The agent to seat for it; missing means the office default at the time. */
-  agent?: AgentId;
   /** The worker seated for it (it may have gone home since). */
   workerId?: string;
   workerName?: string;
@@ -218,6 +252,18 @@ export interface QueueState {
   maxWorkers: number;
 }
 
+/** Where a team webhook posts: Slack and Discord get their own message format, anything else plain JSON. */
+export type WebhookKind = 'slack' | 'discord' | 'other';
+
+/** The office's Slack / Discord webhook, pinged when a worker needs input or finishes (see server/webhook.ts). */
+export interface NotifyState {
+  /** Never the URL itself (it lets anyone post to the channel): just where it goes. */
+  webhook?: { kind: WebhookKind; hint: string; by: string; at: number };
+  /** Why the last post failed, until one gets through. */
+  error?: string;
+  lastSentAt?: number;
+}
+
 export interface GhState<T> {
   items: T[];
   error?: string;
@@ -226,6 +272,9 @@ export interface GhState<T> {
 }
 
 export type GhMergeMethod = 'squash' | 'merge' | 'rebase';
+
+/** Why an issue was closed, as GitHub records it. */
+export type GhCloseReason = 'completed' | 'not planned';
 
 /** How the repository lets pull requests be merged. */
 export interface GhRepoInfo {
@@ -285,24 +334,129 @@ export interface GhPullDetail {
   reviewComments: GhReviewComment[];
   checks: GhCheck[];
   repo: GhRepoInfo;
+  /** Who gh is signed in as on the server, and so who comments from the office appear from ('' if unknown). */
+  viewer: string;
 }
 
 /** GET /api/gh/issue?number=N */
 export interface GhIssueDetail {
   number: number;
+  /** OPEN or CLOSED. */
+  state: string;
   body: string;
   comments: GhComment[];
+  /** See GhPullDetail.viewer. */
+  viewer: string;
 }
+
+/** GitHub turns away comments longer than this. */
+export const GH_COMMENT_MAX = 65536;
 
 export interface ProjectInfo {
   name: string;
   dir: string;
   branch?: string;
   remote?: string;
-  /** The default agent's command line. */
   agentCmd: string;
-  agents: AgentOption[];
-  defaultAgent: AgentId;
+  defaultProvider: AgentProvider;
+  agentProviders: AgentProvider[];
+}
+
+/**
+ * One floor of the building: a project in its own checkout, with its own desks, workers, boards
+ * and queue. You go between them in the elevator.
+ */
+export interface FloorInfo {
+  id: string;
+  /** The repository's name, or the folder's when it isn't on GitHub. */
+  name: string;
+  /** owner/name on GitHub. */
+  repo?: string;
+  /** Its checkout on the office's machine. */
+  dir: string;
+  /** Which of FLOOR_PALETTES it's painted in. */
+  palette: number;
+  /** Being cloned: on the elevator panel, but nobody can go there yet. */
+  cloning?: boolean;
+  addedBy: string;
+  addedAt: number;
+  /** For the elevator panel: who's there and what they're up to. */
+  workers: number;
+  busy: number;
+  /** Workers waiting on someone: a question, a permission, or a finished turn nobody looked at. */
+  waiting: number;
+  people: number;
+}
+
+/** A repository the office's `gh` login can clone, for the elevator's "add a project". */
+export interface RepoChoice {
+  /** owner/name */
+  name: string;
+  description?: string;
+  private: boolean;
+  /** ISO time of the last push. */
+  pushedAt?: string;
+}
+
+/** Everything that belongs to the floor you're on: sent when you walk in, and when you change floors. */
+export interface FloorView {
+  /** The floor you're on; null while the building has none. */
+  floor: string | null;
+  project: ProjectInfo | null;
+  workers: WorkerInfo[];
+  issues: GhState<GhIssue>;
+  pulls: GhState<GhPull>;
+  queue: QueueState;
+  /** Pictures on this floor's walls. */
+  decor: Decoration[];
+  services: ServicesState;
+  /** The floor's dog; null in a building with no floors yet. */
+  dog: DogState | null;
+  /** What the lounge jukebox is playing. */
+  jukebox: JukeboxState;
+  /** What's drawn on this floor's whiteboard, and who's drawing. */
+  whiteboard: WhiteboardView;
+}
+
+export type AccountRole = 'admin' | 'member';
+
+/** Who this browser is signed in as. */
+export interface Me {
+  /** Your own account; missing when you came in with the shared office password. */
+  account?: { name: string; role: AccountRole };
+  /** May invite, list and revoke accounts. */
+  admin: boolean;
+}
+
+export interface AccountInfo {
+  id: string;
+  name: string;
+  role: AccountRole;
+  createdAt: number;
+  createdBy: string;
+  lastSeenAt?: number;
+  /** In the office right now. */
+  online: boolean;
+}
+
+/** A single-use link that makes a named account: /join#<token>. */
+export interface AccountInvite {
+  id: string;
+  token: string;
+  /** The name the account gets; when missing, whoever opens the link picks one. */
+  name?: string;
+  role: AccountRole;
+  createdBy: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+/** Per-person accounts, for admins (see server/accounts.ts). */
+export interface AccountsState {
+  accounts: AccountInfo[];
+  invites: AccountInvite[];
+  /** Whether the shared office password still lets people in. */
+  sharedPassword: boolean;
 }
 
 export interface TeamMember {
@@ -335,7 +489,7 @@ export interface ServiceInfo {
   command: string;
   /** The worker whose terminal started it. */
   workerId: string;
-  /** Its working directory relative to the office dir ('' is the project root). */
+  /** Its working directory relative to its floor's checkout ('' is the project root). */
   cwd?: string;
   /** The <title> of its front page. */
   title?: string;
@@ -420,20 +574,68 @@ export interface UpgradeState {
   error?: string;
 }
 
+export type Weather = 'clear' | 'cloudy' | 'rain' | 'storm' | 'snow' | 'fog';
+export const WEATHERS: readonly Weather[] = ['clear', 'cloudy', 'rain', 'storm', 'snow', 'fog'];
+
+/** What it's like outside the windows. The server decides it, so everyone sees the same sky. */
+export interface SkyState {
+  /** Where the office is, for the sun: a configured city, or a guess from the host's time zone. */
+  lat: number;
+  lon: number;
+  /** The office's clock, in minutes east of UTC. */
+  utcOffset: number;
+  weather: Weather;
+  /** 0–1: a drizzle to a downpour, a few flakes to a blizzard, haze to pea soup. */
+  intensity: number;
+  /** The city whose live forecast this is. Unset when the weather is made up or pinned. */
+  city?: string;
+  /** °C, from the forecast. */
+  temp?: number;
+}
+
 export interface ChatLine {
   from: string;
   name: string;
   color: string;
   text: string;
   at: number;
+  /** Said by someone signed in with their own account. */
+  account?: boolean;
 }
+
+/** A line of a worker's terminal that matched a search. */
+export interface TerminalHit {
+  workerId: string;
+  /** The line, cut down around the match. */
+  text: string;
+  /** Where it is: its row in the worker's terminal, and how many rows that terminal had. */
+  row: number;
+  rows: number;
+}
+
+/** What GET /api/search answers: matching chat and terminal lines, newest first. */
+export interface SearchResults {
+  q: string;
+  chat: ChatLine[];
+  terminals: TerminalHit[];
+  /** More lines matched than these. */
+  more: boolean;
+}
+
+/** Why the gong rang. */
+export type GongWhy = 'hit' | 'merged' | 'queue';
 
 export type ClientMsg =
   | { t: 'move'; x: number; y: number; z: number; rotY: number; moving: boolean }
-  /** You reached out to use something; everyone else sees your character's arm do it. */
-  | { t: 'act' }
+  /**
+   * You reached out to use something; everyone else sees your character's arm do it. With `smoke`,
+   * you lit a cigarette (or put it out) on the balcony instead.
+   */
+  | { t: 'act'; smoke?: boolean }
+  /** You sat down in a place on a couch, a beanbag, a chair or the bench (see seatAt in layout), or got up again (no seat). */
+  | { t: 'sit'; seat?: string }
   | { t: 'profile'; name: string; color: string; look: Look }
-  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind; agent?: AgentId }
+  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind; provider?: AgentProvider; model?: string }
   | { t: 'worker.resume'; workerId: string }
   | { t: 'worker.kill'; workerId: string; cleanup?: WorktreeCleanup }
   /** Asks what the worker's worktree holds; answered with a `worker.worktree` message. */
@@ -441,6 +643,11 @@ export type ClientMsg =
   | { t: 'worker.attach'; workerId: string }
   | { t: 'worker.detach'; workerId: string }
   | { t: 'worker.prompt'; workerId: string; prompt: string }
+  /**
+   * A prompt for the agent standing by a board (`deskId` is its kiosk, see STATIONS in layout). It's
+   * typed into its session, which is woken up first if it's asleep, or hired there when nobody is.
+   */
+  | { t: 'station.prompt'; deskId: string; prompt: string }
   /** Push a worktree worker's branch and open a pull request for it, drafted from its task. */
   | { t: 'worker.pr'; workerId: string }
   | { t: 'term.input'; workerId: string; data: string }
@@ -448,7 +655,13 @@ export type ClientMsg =
   | { t: 'gh.refresh' }
   /** Merge a pull request; the answer comes back as gh.merged. */
   | { t: 'gh.merge'; number: number; method: GhMergeMethod; deleteBranch: boolean; auto?: boolean }
-  | { t: 'queue.add'; prompt: string; title?: string; issue?: number; agent?: AgentId }
+  /** Comment on an issue or a PR's conversation, as the server's gh account; answered with gh.commented. */
+  | { t: 'gh.comment'; kind: 'issue' | 'pull'; number: number; body: string }
+  /** Hit the office gong (E at the gong); everyone on the floor hears it. */
+  | { t: 'gong' }
+  /** Close an issue, or a pull request without merging it; the answer comes back as gh.closed. */
+  | { t: 'gh.close'; kind: 'issue' | 'pull'; number: number; comment?: string; reason?: GhCloseReason; deleteBranch?: boolean }
+  | { t: 'queue.add'; prompt: string; title?: string; issue?: number; provider?: AgentProvider; model?: string }
   | { t: 'queue.remove'; taskId: string }
   /** Move a queued task up (-1) or down (+1) the queue. */
   | { t: 'queue.move'; taskId: string; delta: number }
@@ -457,12 +670,24 @@ export type ClientMsg =
   /** Forget the finished tasks. */
   | { t: 'queue.clear' }
   | { t: 'queue.limit'; maxWorkers: number }
+  /** Set the office's Slack / Discord webhook; '' removes it. */
+  | { t: 'notify.webhook'; url: string }
+  /** Post a test message through the webhook; the outcome comes back as a toast. */
+  | { t: 'notify.test' }
   | { t: 'voice'; voice: boolean; muted: boolean; sharing: boolean }
   | { t: 'rtc'; to: string; data: unknown }
   | { t: 'chat'; text: string }
   | { t: 'team.get' }
   | { t: 'team.invite'; github: string }
   | { t: 'team.remove'; name: string }
+  /** The rest of the accounts messages are for admins only. */
+  | { t: 'accounts.get' }
+  | { t: 'accounts.invite'; name?: string; role: AccountRole }
+  | { t: 'accounts.cancel'; inviteId: string }
+  | { t: 'accounts.revoke'; accountId: string }
+  | { t: 'accounts.role'; accountId: string; role: AccountRole }
+  /** Let the shared office password sign people in, or stop it. */
+  | { t: 'accounts.shared'; on: boolean }
   /** Follow what a worker changed (the office polls its checkout while anyone watches). */
   | { t: 'changes.watch'; workerId: string }
   | { t: 'changes.unwatch'; workerId: string }
@@ -473,22 +698,46 @@ export type ClientMsg =
   | { t: 'changes.pr'; workerId: string; title: string; body: string }
   | { t: 'upgrade.check' }
   | { t: 'upgrade.start' }
+  /** Read the Claude plan limits again now, instead of at the next poll. */
+  | { t: 'limits.refresh' }
   /** Hang a picture on a wall. */
   | { t: 'decor.add'; decor: DecorPlacement }
   /** Move, resize, re-frame or swap the image of a picture. */
   | { t: 'decor.update'; id: string; decor: Partial<DecorPlacement> }
   | { t: 'decor.remove'; id: string }
+  /** Put a tune on the jukebox (a JUKEBOX_TUNES id), or a stream; with neither, turn it back on. */
+  | { t: 'jukebox.play'; track?: string; url?: string }
+  /** On to the next tune. */
+  | { t: 'jukebox.skip' }
+  | { t: 'jukebox.stop' }
+  /** You opened the whiteboard (or closed it): everyone on the floor sees who's drawing. */
+  | { t: 'wb.open' }
+  | { t: 'wb.close' }
+  /** Elements you added or changed on the whiteboard; pictures go first, by POST /api/whiteboard/file. */
+  | { t: 'wb.update'; elements: WbElement[] }
+  /** Where your mouse is on the whiteboard, and what you have selected there. */
+  | ({ t: 'wb.pointer'; selected?: string[] } & WbPointer)
+  /** Ride the elevator to another floor; the server answers with `floor.enter`. */
+  | { t: 'floor.go'; floor: string }
+  /** The repositories that could become a floor; answered with `floor.repos`. */
+  | { t: 'floor.repos'; refresh?: boolean }
+  /** Clone a repository and make it a new floor; answered with `floor.added` once it's there. */
+  | { t: 'floor.add'; repo: string }
+  /** Give the dog on your floor a pat; it has to be within reach. */
+  | { t: 'dog.pet' }
+  /** Name the dog on your floor ('' gives it back its first name). */
+  | { t: 'dog.name'; name: string }
   | { t: 'ping'; at: number };
 
 export type ServerMsg =
-  | {
+  | ({
       t: 'welcome';
       you: string;
       peers: PeerInfo[];
-      workers: WorkerInfo[];
-      project: ProjectInfo;
-      issues: GhState<GhIssue>;
-      pulls: GhState<GhPull>;
+      /** Every floor of the building, for the elevator. */
+      floors: FloorInfo[];
+      /** Where new projects are cloned to, on the office's machine. */
+      projectsDir: string;
       ice: { urls: string | string[]; username?: string; credential?: string }[];
       chat: ChatLine[];
       /** Whether teammates can be invited from the office (see TeamState). */
@@ -496,17 +745,25 @@ export type ServerMsg =
       /** The running server's version; a change after a reconnect means the office was upgraded. */
       version: string;
       upgrade: UpgradeState;
-      services: ServicesState;
-      /** Pictures on the walls. */
-      decor: Decoration[];
       usage: UsageState;
-      queue: QueueState;
-    }
+      limits: PlanLimits;
+      me: Me;
+      notify: NotifyState;
+      /** Outside the windows: the same on every floor. */
+      sky: SkyState;
+    } & FloorView)
+  /** You arrived on another floor: everything on it, replacing the last one's, and where everyone is now. */
+  | ({ t: 'floor.enter'; peers: PeerInfo[] } & FloorView)
+  | { t: 'floors'; floors: FloorInfo[] }
+  /** Sent to whoever asked. */
+  | { t: 'floor.repos'; repos: RepoChoice[]; error?: string }
+  /** Sent to whoever asked for the floor, once it's cloned (or couldn't be). */
+  | { t: 'floor.added'; repo: string; floor?: string; error?: string }
   | { t: 'peer.join'; peer: PeerInfo }
   | { t: 'peer.update'; peer: PeerInfo }
   | { t: 'peer.move'; id: string; x: number; y: number; z: number; rotY: number; moving: boolean }
   | { t: 'peer.leave'; id: string }
-  | { t: 'peer.act'; id: string }
+  | { t: 'peer.act'; id: string; smoke?: boolean }
   | { t: 'worker.update'; worker: WorkerInfo }
   | { t: 'worker.remove'; workerId: string }
   | { t: 'worker.worktree'; workerId: string; state: WorktreeState }
@@ -517,6 +774,15 @@ export type ServerMsg =
   | { t: 'gh.pulls'; state: GhState<GhPull> }
   /** Sent to whoever asked for the merge. */
   | { t: 'gh.merged'; number: number; error?: string }
+  /** Sent to whoever commented: the comment as GitHub saved it, or why it wasn't. */
+  | { t: 'gh.commented'; kind: 'issue' | 'pull'; number: number; comment?: GhComment; error?: string }
+  /**
+   * The gong rings, for everyone on the floor: someone hit it, pull request `pr` merged (confetti
+   * over the desk it came from), or the last task on the queue just finished (a bigger party).
+   */
+  | { t: 'gong'; why: GongWhy; by?: string; pr?: number }
+  /** Sent to whoever asked to close it. */
+  | { t: 'gh.closed'; kind: 'issue' | 'pull'; number: number; error?: string }
   | { t: 'rtc'; from: string; data: unknown }
   | ({ t: 'chat' } & ChatLine)
   | { t: 'toast'; text: string; level: 'info' | 'warn' | 'error' }
@@ -524,11 +790,30 @@ export type ServerMsg =
   | { t: 'upgrade'; state: UpgradeState }
   | { t: 'services'; state: ServicesState }
   | { t: 'decor'; items: Decoration[] }
+  /** What the dog on your floor is up to now: sent at the start of each leg of its day. */
+  | { t: 'dog'; dog: DogState }
+  | { t: 'jukebox'; state: JukeboxState }
+  /** Someone changed these elements on the floor's whiteboard (sent to everyone else on the floor). */
+  | { t: 'wb.update'; elements: WbElement[] }
+  /** Who has the floor's whiteboard open now. */
+  | { t: 'wb.people'; people: string[] }
+  /** Someone's mouse on the whiteboard; only people who have it open get these. */
+  | ({ t: 'wb.pointer'; id: string; selected?: string[] } & WbPointer)
   | { t: 'usage'; state: UsageState }
+  | { t: 'limits'; state: PlanLimits }
   | { t: 'queue'; state: QueueState }
+  | { t: 'notify'; state: NotifyState }
+  | { t: 'sky'; state: SkyState }
   /** Sent to whoever watches that worker's changes, whenever they change. */
   | { t: 'changes'; state: ChangesState }
   | { t: 'changes.diff'; workerId: string; path: string; diff: string; truncated: boolean; error?: string }
   /** Sent to whoever asked for the invite. */
   | { t: 'team.invited'; github: string; name?: string; keys?: number; error?: string }
-  | { t: 'pong'; at: number };
+  /** Sent to admins, when asked and whenever accounts change. */
+  | { t: 'accounts'; state: AccountsState }
+  /** Sent to whoever made the invite. */
+  | { t: 'accounts.invited'; invite?: AccountInvite; error?: string }
+  /** Your role changed. */
+  | { t: 'me'; me: Me }
+  /** `now` is the office's clock as it answered, which the jukebox keeps time by. */
+  | { t: 'pong'; at: number; now: number };

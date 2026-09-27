@@ -1,12 +1,18 @@
 import { randomBytes, scryptSync } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { isAgentId, type AgentId } from '../shared/protocol.js';
+import { WEATHERS, type Weather } from '../shared/protocol.js';
 
 export interface Config {
+  /** The office's own folder: the building's data lives in its .agent-office. */
   dir: string;
   dataDir: string;
+  /** Where new floors are cloned, as <projectsDir>/<owner>/<repo>. */
+  projectsDir: string;
+  /** Started as `agent-office <dir>`: that checkout is a floor of its own (it's also `dir`). */
+  project?: string;
   host: string;
   port: number;
   /** Plaintext password, only when known: from --password, or generated and not yet claimed. */
@@ -21,24 +27,23 @@ export interface Config {
   claimed: boolean;
   /** Forget the plaintext password for good once it has been shown. */
   markClaimed(): void;
-  /** The agents workers can run. Claude Code and Cursor always; `custom` only for an unknown --agent. */
-  agents: Partial<Record<AgentId, AgentConfig>>;
-  /** What a new worker runs when nobody picks. */
-  defaultAgent: AgentId;
+  agentCmd: string;
+  agentArgs: string[];
   tls?: { cert: string; key: string };
   trustProxy: boolean;
   iceServers: RTCIceServerLike[];
   /** Address teammates SSH-tunnel to (set by deploy/aws.sh); enables invites from the office. */
   publicHost?: string;
-  /** Daily spend budget for all workers, USD. */
+  /** Daily tracked Claude Code spend budget, USD. OpenCode/Codex spend is excluded. */
   budget?: number;
   /** Refuse new hires for the rest of the day once the budget is spent. */
   budgetPause: boolean;
-}
-
-export interface AgentConfig {
-  cmd: string;
-  args: string[];
+  /** Slack / Discord webhook to post to when a worker needs input or finishes ('' turns it off). */
+  webhook?: string;
+  /** Where the office is: its sun and live weather follow this city's forecast. */
+  city?: string;
+  /** Weather pinned for good, instead of made up or forecast. */
+  weather?: Weather;
 }
 
 export interface RTCIceServerLike {
@@ -47,21 +52,35 @@ export interface RTCIceServerLike {
   credential?: string;
 }
 
-const HELP = `agent-office — a 3D office for your team and its Claude Code and Cursor workers
+const HELP = `agent-office — a 3D office for your team and its Claude Code / OpenCode / Codex workers
 
 Usage:
+  agent-office [options]
   agent-office [dir] [options]
   agent-office prune [dir] [--dry-run] [--force]
+  agent-office accounts [list|invite|revoke|role|password] ...
 
-Runs the office for the project in [dir] (default: current directory).
-Every worker, terminal and GitHub board is scoped to that directory.
+Runs the office. Every project is a floor of the building: ride the elevator,
+pick one of the repositories your \`gh\` login can see, and the office clones it
+into the projects folder as a new floor. Workers, terminals, boards and the
+task queue on a floor all belong to that floor's checkout.
+
+Started from anywhere, the office keeps its data in --home. Given a [dir] (or
+started in a project where an office already ran), it keeps its data in
+<dir>/.agent-office as it always has, and that project is one of the floors.
 
 Commands:
   prune                   Remove leftover worker worktrees (.agent-office/worktrees/)
                           and their office/* branches. Anything with uncommitted
                           changes or unpushed commits is kept unless --force is given.
+  accounts                Invite, list and revoke people's own accounts, and switch
+                          the shared password off or on (see accounts --help)
 
 Options:
+      --home <dir>        Where the office keeps its data when no [dir] is given
+                          (default ~/agent-office, env AGENT_OFFICE_HOME)
+      --projects <dir>    Where new floors are cloned, as <dir>/<owner>/<repo>
+                          (default ~/agent-office, env AGENT_OFFICE_PROJECTS)
   -p, --port <n>          Port to listen on (default 4600, env PORT)
   -H, --host <addr>       Address to bind (default 0.0.0.0)
       --password <pw>     Office password (env AGENT_OFFICE_PASSWORD).
@@ -72,28 +91,30 @@ Options:
                           is kept and the password is never displayed again.
       --reset-password    Forget the generated password (a new one is made on the
                           next start) and exit
-      --default-agent <a> What a new worker runs unless someone picks: claude or
-                          cursor (default claude, env AGENT_OFFICE_DEFAULT_AGENT)
-      --claude-cmd <cmd>  Claude Code command (default "claude", env AGENT_OFFICE_CLAUDE_CMD)
-      --claude-args <s>   Extra args for Claude workers, e.g. "--model opus"
-                          (env AGENT_OFFICE_CLAUDE_ARGS)
-      --cursor-cmd <cmd>  Cursor CLI command (default "cursor-agent", env AGENT_OFFICE_CURSOR_CMD)
-      --cursor-args <s>   Extra args for Cursor workers, e.g. "--model gpt-5.5"
-                          (env AGENT_OFFICE_CURSOR_ARGS)
-      --agent <cmd>       Older form: claude, cursor, or a command. Any other command
-                          runs as a plain terminal (env AGENT_OFFICE_AGENT)
-      --agent-args <str>  Extra args for the --agent one (env AGENT_OFFICE_AGENT_ARGS)
+      --agent <cmd>       Default agent command (default "claude", env AGENT_OFFICE_AGENT)
+      --agent-args <str>  Extra args for the configured agent, e.g. "--model opus"
+                          Workers can also select Claude Code, OpenCode or Codex in the UI
       --tls-cert <file>   Serve HTTPS with this certificate (PEM)
       --tls-key <file>    ...and this private key (PEM)
       --self-signed       Serve HTTPS with a generated self-signed certificate
       --trust-proxy       Trust X-Forwarded-* headers (behind Caddy/nginx)
       --turn <url>        Add a TURN server for voice (repeatable), e.g.
                           turn:user:pass@turn.example.com:3478
-      --budget <usd>      Daily budget for all workers together (env
+      --budget <usd>      Daily budget for tracked Claude Code spend (env
                           AGENT_OFFICE_BUDGET). Everyone is warned when the
-                          day's spend passes it
+                          day's spend passes it. OpenCode/Codex spend is excluded
       --budget-pause      ...and no new workers can be hired until the next
                           day (env AGENT_OFFICE_BUDGET_PAUSE=1)
+      --webhook <url>     Post to this Slack or Discord webhook when a worker
+                          needs input or finishes (env AGENT_OFFICE_WEBHOOK).
+                          Also settable from ⚙️ Settings in the office; "" turns it off
+      --city <name>       Put the office in a real city, e.g. "Berlin" or
+                          "Portland, Oregon" (env AGENT_OFFICE_CITY): day, night
+                          and the weather outside follow its live forecast from
+                          open-meteo.com. Without it the sun follows this
+                          machine's clock and the weather is made up
+      --weather <kind>    Pin the weather: clear, cloudy, rain, storm, snow or
+                          fog (env AGENT_OFFICE_WEATHER)
   -h, --help              Show this help
 
 Voice and screen sharing need a secure context: use https (a reverse proxy,
@@ -107,16 +128,6 @@ function takeValue(args: string[], i: number, flag: string): string {
     process.exit(2);
   }
   return v;
-}
-
-/** Like takeValue, but the value may itself start with dashes ("--model opus"). */
-function takeArgs(args: string[], i: number, flag: string): string[] {
-  const v = args[i + 1];
-  if (v === undefined) {
-    console.error(`agent-office: ${flag} needs a value`);
-    process.exit(2);
-  }
-  return splitArgs(v);
 }
 
 function splitArgs(s: string): string[] {
@@ -134,8 +145,13 @@ function parseTurn(url: string): RTCIceServerLike {
   return { urls: url };
 }
 
+/** Where the office lives when it isn't started in a project: ~/agent-office, or $AGENT_OFFICE_HOME. */
+export function officeHome(): string {
+  return path.resolve(process.env.AGENT_OFFICE_HOME || path.join(os.homedir(), 'agent-office'));
+}
+
 /** Keep the office's own data out of git without touching the project's .gitignore. */
-function excludeFromGit(dir: string) {
+export function excludeFromGit(dir: string) {
   try {
     const gitDir = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     const exclude = path.resolve(dir, gitDir, 'info', 'exclude');
@@ -150,18 +166,15 @@ function excludeFromGit(dir: string) {
 }
 
 export function loadConfig(argv: string[]): Config {
-  let dir = process.cwd();
+  let project = '';
+  let home = officeHome();
+  let homeGiven = !!process.env.AGENT_OFFICE_HOME;
+  let projects = process.env.AGENT_OFFICE_PROJECTS ? path.resolve(process.env.AGENT_OFFICE_PROJECTS) : '';
   let port = Number(process.env.PORT) || 4600;
   let host = '0.0.0.0';
   let password = process.env.AGENT_OFFICE_PASSWORD || '';
-  const env = process.env;
-  let legacyCmd = env.AGENT_OFFICE_AGENT || '';
-  let legacyArgs: string[] | undefined = env.AGENT_OFFICE_AGENT_ARGS ? splitArgs(env.AGENT_OFFICE_AGENT_ARGS) : undefined;
-  let defaultAgent = env.AGENT_OFFICE_DEFAULT_AGENT || '';
-  let claudeCmd = env.AGENT_OFFICE_CLAUDE_CMD || '';
-  let claudeArgs: string[] | undefined = env.AGENT_OFFICE_CLAUDE_ARGS ? splitArgs(env.AGENT_OFFICE_CLAUDE_ARGS) : undefined;
-  let cursorCmd = env.AGENT_OFFICE_CURSOR_CMD || '';
-  let cursorArgs: string[] | undefined = env.AGENT_OFFICE_CURSOR_ARGS ? splitArgs(env.AGENT_OFFICE_CURSOR_ARGS) : undefined;
+  let agentCmd = process.env.AGENT_OFFICE_AGENT || 'claude';
+  let agentArgs: string[] = splitArgs(process.env.AGENT_OFFICE_AGENT_ARGS || '');
   let tlsCert = '';
   let tlsKey = '';
   let selfSigned = false;
@@ -170,6 +183,9 @@ export function loadConfig(argv: string[]): Config {
   let resetPassword = false;
   let budget = process.env.AGENT_OFFICE_BUDGET || '';
   let budgetPause = !!process.env.AGENT_OFFICE_BUDGET_PAUSE && process.env.AGENT_OFFICE_BUDGET_PAUSE !== '0';
+  let webhook = process.env.AGENT_OFFICE_WEBHOOK;
+  let city = process.env.AGENT_OFFICE_CITY || '';
+  let weather = process.env.AGENT_OFFICE_WEATHER || '';
   const iceServers: RTCIceServerLike[] = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
 
   for (let i = 0; i < argv.length; i++) {
@@ -191,25 +207,10 @@ export function loadConfig(argv: string[]): Config {
         password = takeValue(argv, i++, a);
         break;
       case '--agent':
-        legacyCmd = takeValue(argv, i++, a);
+        agentCmd = takeValue(argv, i++, a);
         break;
       case '--agent-args':
-        legacyArgs = takeArgs(argv, i++, a);
-        break;
-      case '--default-agent':
-        defaultAgent = takeValue(argv, i++, a);
-        break;
-      case '--claude-cmd':
-        claudeCmd = takeValue(argv, i++, a);
-        break;
-      case '--claude-args':
-        claudeArgs = takeArgs(argv, i++, a);
-        break;
-      case '--cursor-cmd':
-        cursorCmd = takeValue(argv, i++, a);
-        break;
-      case '--cursor-args':
-        cursorArgs = takeArgs(argv, i++, a);
+        agentArgs = splitArgs(takeValue(argv, i++, a));
         break;
       case '--tls-cert':
         tlsCert = takeValue(argv, i++, a);
@@ -238,39 +239,61 @@ export function loadConfig(argv: string[]): Config {
       case '--budget-pause':
         budgetPause = true;
         break;
+      case '--webhook':
+        webhook = takeValue(argv, i++, a);
+        break;
+      case '--home':
+        home = path.resolve(takeValue(argv, i++, a));
+        homeGiven = true;
+        break;
+      case '--projects':
+        projects = path.resolve(takeValue(argv, i++, a));
+        break;
+      case '--city':
+        city = takeValue(argv, i++, a);
+        break;
+      case '--weather':
+        weather = takeValue(argv, i++, a);
+        break;
       default:
         if (a.startsWith('-')) {
           console.error(`agent-office: unknown option ${a}\n`);
           process.stderr.write(HELP);
           process.exit(2);
         }
-        dir = path.resolve(a);
+        project = path.resolve(a);
     }
   }
 
-  if (!existsSync(dir)) {
-    console.error(`agent-office: directory not found: ${dir}`);
+  // An office already runs in this project (started here before there were floors): carry on with
+  // it, its workers and its password, rather than open an empty building somewhere else.
+  const cwd = process.cwd();
+  if (!project && !homeGiven && cwd !== home && existsSync(path.join(cwd, '.agent-office', 'config.json'))) project = cwd;
+  if (project && !existsSync(project)) {
+    console.error(`agent-office: directory not found: ${project}`);
     process.exit(2);
   }
+  const dir = project || home;
+  // New floors go next to the office's data when it has a home of its own, and never into a project.
+  const projectsDir = projects || (project ? path.join(os.homedir(), 'agent-office') : home);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     console.error('agent-office: invalid --port');
     process.exit(2);
   }
-  if (defaultAgent && (!isAgentId(defaultAgent) || defaultAgent === 'custom')) {
-    console.error('agent-office: --default-agent is claude or cursor');
-    process.exit(2);
-  }
-  const { agents, defaultAgent: chosen } = resolveAgents({ legacyCmd, legacyArgs, defaultAgent: defaultAgent as AgentId | '', claudeCmd, claudeArgs, cursorCmd, cursorArgs });
-
   const budgetUsd = budget ? Number(budget.replace(/^\$/, '')) : undefined;
   if (budgetUsd !== undefined && !(budgetUsd > 0)) {
     console.error('agent-office: --budget needs an amount in dollars, e.g. --budget 20');
     process.exit(2);
   }
+  weather = weather.trim().toLowerCase();
+  if (weather && !(WEATHERS as readonly string[]).includes(weather)) {
+    console.error(`agent-office: --weather is one of ${WEATHERS.join(', ')}`);
+    process.exit(2);
+  }
 
   const dataDir = path.join(dir, '.agent-office');
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  excludeFromGit(dir);
+  if (project) excludeFromGit(dir);
 
   const cfgPath = path.join(dataDir, 'config.json');
   let stored: { password?: string; verifier?: string; salt?: string; secret?: string; claimedAt?: number } = {};
@@ -328,6 +351,8 @@ export function loadConfig(argv: string[]): Config {
   return {
     dir,
     dataDir,
+    projectsDir,
+    project: project || undefined,
     host,
     port,
     password: password || undefined,
@@ -344,14 +369,17 @@ export function loadConfig(argv: string[]): Config {
       this.claimed = true;
       this.password = undefined;
     },
-    agents,
-    defaultAgent: chosen,
+    agentCmd,
+    agentArgs,
     tls,
     trustProxy,
     iceServers,
     publicHost: process.env.AGENT_OFFICE_PUBLIC_HOST || undefined,
     budget: budgetUsd,
     budgetPause,
+    webhook,
+    city: city.trim() || undefined,
+    weather: (weather as Weather) || undefined,
   };
 }
 
@@ -369,42 +397,4 @@ export async function ensureSelfSigned(cfg: Config): Promise<void> {
   writeFileSync(certPath, pems.cert, { mode: 0o600 });
   writeFileSync(keyPath, pems.private, { mode: 0o600 });
   cfg.tls = { cert: pems.cert, key: pems.private };
-}
-
-/**
- * The agents and which one is the default. The per-agent flags win; the older --agent names one of
- * them (claude, cursor, or a path to either) or, for anything else, a custom command that runs as a
- * plain terminal the way every non-Claude agent used to.
- */
-export function resolveAgents(o: {
-  legacyCmd: string;
-  legacyArgs?: string[];
-  defaultAgent: AgentId | '';
-  claudeCmd: string;
-  claudeArgs?: string[];
-  cursorCmd: string;
-  cursorArgs?: string[];
-}): { agents: Partial<Record<AgentId, AgentConfig>>; defaultAgent: AgentId } {
-  const agents: Partial<Record<AgentId, AgentConfig>> = { claude: { cmd: 'claude', args: [] }, cursor: { cmd: 'cursor-agent', args: [] } };
-  let target: AgentId = 'claude';
-  if (o.legacyCmd) {
-    const base = path.basename(o.legacyCmd);
-    if (o.legacyCmd === 'claude' || o.legacyCmd === 'cursor') target = o.legacyCmd;
-    else if (base === 'claude') {
-      target = 'claude';
-      agents.claude!.cmd = o.legacyCmd;
-    } else if (base === 'cursor-agent' || base === 'agent') {
-      target = 'cursor';
-      agents.cursor!.cmd = o.legacyCmd;
-    } else {
-      target = 'custom';
-      agents.custom = { cmd: o.legacyCmd, args: [] };
-    }
-  }
-  if (o.legacyArgs) agents[target]!.args = o.legacyArgs;
-  if (o.claudeCmd) agents.claude!.cmd = o.claudeCmd;
-  if (o.claudeArgs) agents.claude!.args = o.claudeArgs;
-  if (o.cursorCmd) agents.cursor!.cmd = o.cursorCmd;
-  if (o.cursorArgs) agents.cursor!.args = o.cursorArgs;
-  return { agents, defaultAgent: o.defaultAgent || (o.legacyCmd ? target : 'claude') };
 }

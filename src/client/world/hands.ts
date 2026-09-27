@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { REACH_TIME, reachCurve } from './character';
+import { REACH_TIME, SMOKE_CYCLE, cigarette, coffeeMug, dragCurve, reachCurve } from './character';
 import { mesh, toon, toonUnique } from './toon';
 
 export interface HandsInput {
@@ -8,7 +8,12 @@ export interface HandsInput {
   walkPhase: number;
   walking: boolean;
   airborne: boolean;
+  /** 0 (steady) to 1: one coffee too many. */
+  jitter: number;
 }
+
+/** Lifting the mug for a sip and lowering it again, in seconds. */
+const SIP_TIME = 1.1;
 
 interface Arm {
   group: THREE.Group;
@@ -28,21 +33,60 @@ export class Hands {
   private right: Arm;
   private left: Arm;
   private reachT = -1;
+  private mug: THREE.Group;
+  /** Seconds into a sip (negative while it waits for the reach to finish), or null. */
+  private sipT: number | null = null;
   private sway = new THREE.Vector2();
   private last: { yaw: number; pitch: number } | null = null;
   private air = 0;
   private walk = 0;
+  private cig: THREE.Group;
+  private ember: THREE.MeshToonMaterial;
+  /** Each light, and how bright it is where it's brightest. */
+  private lights: [THREE.Light, number][] = [];
+  private lightLevel = 1;
+  /** Seconds into a smoke break, or -1. Runs in step with your character's (see Person.setSmoking). */
+  private smokeT = -1;
 
   constructor(shirt: string, skin: string) {
     this.sleeve = toonUnique(shirt);
     this.skin = toonUnique(skin);
-    this.scene.add(new THREE.HemisphereLight('#fff5e6', '#c9a27a', 1.5));
-    this.scene.add(new THREE.AmbientLight('#ffffff', 0.5));
     const sun = new THREE.DirectionalLight('#fff1d6', 2);
     sun.position.set(-0.6, 1.4, 0.9);
-    this.scene.add(sun);
+    for (const l of [new THREE.HemisphereLight('#fff5e6', '#c9a27a', 1.5), new THREE.AmbientLight('#ffffff', 0.5), sun]) {
+      this.scene.add(l);
+      this.lights.push([l, l.intensity]);
+    }
     this.right = this.arm(1);
     this.left = this.arm(-1);
+    // In the left hand, handle in the palm, standing upright however the arm is turned.
+    this.mug = coffeeMug();
+    this.mug.position.set(0.09, -0.035, -0.03);
+    this.mug.quaternion.setFromEuler(this.left.baseRot).invert();
+    this.mug.visible = false;
+    this.left.group.add(this.mug);
+    // Held between the fingers of the right hand, lit end out past the knuckles.
+    const cig = cigarette();
+    this.cig = cig.group;
+    this.ember = cig.ember;
+    this.cig.scale.setScalar(0.55);
+    this.cig.rotation.set(0.35, Math.PI + 0.5, 0);
+    this.cig.position.set(-0.035, 0.03, -0.075);
+    this.cig.visible = false;
+    this.right.group.add(this.cig);
+  }
+
+  /** Puts a lit cigarette in your right hand, or takes it away. */
+  setSmoking(on: boolean) {
+    if (on === this.smokeT >= 0) return;
+    this.smokeT = on ? 0 : -1;
+    this.cig.visible = on;
+  }
+
+  /** Where the cigarette's lit end is, in camera space (the hands' camera sits where the real one is). */
+  cigTip(out: THREE.Vector3): THREE.Vector3 {
+    this.right.group.updateMatrixWorld(true);
+    return this.cig.localToWorld(out.set(0, 0, 0.09));
   }
 
   setColor(shirt: string) {
@@ -53,6 +97,14 @@ export class Hands {
     this.skin.color.set(skin);
   }
 
+  /** How lit it is where you stand, 0–1 (see Sky.lightAt): your hands go dark out on a night street. */
+  setLight(level: number) {
+    const k = 0.25 + 0.75 * level;
+    if (Math.abs(k - this.lightLevel) < 0.01) return;
+    this.lightLevel = k;
+    for (const [l, full] of this.lights) l.intensity = full * k;
+  }
+
   setAspect(aspect: number) {
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
@@ -61,6 +113,16 @@ export class Hands {
   /** Reach out with the right hand. */
   reach() {
     this.reachT = 0;
+  }
+
+  /** A mug of coffee in the left hand, or not. */
+  holdMug(on: boolean) {
+    this.mug.visible = on;
+  }
+
+  /** Raise the mug for a sip, once the right hand is back from the coffee machine. */
+  sip() {
+    this.sipT = -REACH_TIME * 0.6;
   }
 
   private arm(side: 1 | -1): Arm {
@@ -106,6 +168,13 @@ export class Hands {
       this.reachT += dt;
       if (this.reachT >= REACH_TIME) this.reachT = -1;
     }
+    let sip = 0;
+    if (this.sipT !== null) {
+      this.sipT += dt;
+      sip = reachCurve(this.sipT / SIP_TIME);
+      if (this.sipT >= SIP_TIME) this.sipT = null;
+    }
+    const shake = s.jitter * 0.004;
 
     for (const [arm, side] of [
       [this.right, 1],
@@ -116,6 +185,8 @@ export class Hands {
       p.y += this.sway.y + breathe + bounce + this.air * 0.05;
       // Arms swing opposite each other while walking.
       p.z += side * step * 0.025;
+      p.x += shake * Math.sin(t * 97 + side);
+      p.y += shake * Math.sin(t * 131 + side * 2);
       arm.group.rotation.copy(arm.baseRot);
       arm.group.rotation.x += this.air * 0.2;
     }
@@ -129,5 +200,21 @@ export class Hands {
     r.rotation.z += 0.22 * k;
     this.left.group.position.y -= 0.025 * k;
     this.left.group.position.z += 0.03 * k;
+    // The sip: the mug comes up to your mouth and tips toward you.
+    const l = this.left.group;
+    l.position.x += 0.17 * sip;
+    l.position.y += 0.13 * sip;
+    l.position.z += 0.14 * sip;
+    l.rotation.x += 0.7 * sip;
+    // A drag: the cigarette hand comes up to your mouth, just under the camera, and back down.
+    if (this.smokeT >= 0) {
+      this.smokeT += dt;
+      const d = s.walking || s.airborne ? 0 : dragCurve(this.smokeT % SMOKE_CYCLE);
+      r.position.x -= 0.2 * d;
+      r.position.y += 0.02 * d;
+      r.position.z += 0.3 * d;
+      r.rotation.x += 0.5 * d;
+      this.ember.emissiveIntensity += ((d > 0.9 ? 1.4 : 0.3) - this.ember.emissiveIntensity) * Math.min(1, dt * 6);
+    }
   }
 }

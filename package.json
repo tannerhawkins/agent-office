@@ -1,7 +1,7 @@
 {
   "name": "agent-office",
   "version": "0.1.0",
-  "description": "A cartoon 3D multiplayer office where your team spawns Claude Code and Cursor workers at desks, shares live terminals, talks over voice, and tracks GitHub issues and PRs.",
+  "description": "A cartoon 3D multiplayer office where your team spawns Claude Code workers at desks, shares live terminals, talks over voice, and tracks GitHub issues and PRs.",
   "type": "module",
   "bin": {
     "agent-office": "bin/agent-office.js"
@@ -11,6 +11,7 @@
     "dist"
   ],
   "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
     "dev": "concurrently -k \"vite\" \"tsx watch src/server/cli.ts --port 4600 --password dev\"",
     "build": "npm run build:client && npm run build:server",
     "build:client": "vite build",
@@ -31,7 +32,10 @@
     "ws": "^8.21.3"
   },
   "devDependencies": {
+    "@excalidraw/excalidraw": "^0.18.1",
     "@types/node": "^26.6.3",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "@types/three": "^0.186.0",
     "@types/ws": "^8.18.1",
     "@xterm/addon-fit": "^0.11.0",
@@ -41,6 +45,8 @@
     "dompurify": "^3.4.16",
     "marked": "^18.0.14",
     "playwright-core": "^1.63.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "three": "^0.186.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
