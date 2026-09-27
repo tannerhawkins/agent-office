@@ -202,7 +202,7 @@ async function listRepos(cwd: string): Promise<RepoChoice[]> {
     [
       'api',
       '--paginate',
-      'user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member',
+      'user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator',
       '--jq',
       '.[] | {name: .full_name, description: (.description // ""), private: .private, pushedAt: .pushed_at}',
     ],
