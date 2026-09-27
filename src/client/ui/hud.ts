@@ -1,7 +1,8 @@
 import { store } from '../state';
 import type { Voice } from '../voice';
 import { $, h, openModal, STATUS_LABEL } from './dom';
-import { fmtCost, usageTitle } from './usage';
+import { fmtSpend, usageTitle } from './usage';
+import { workerBadge } from './agentpick';
 
 export function renderPeople(voice: Voice, onEditProfile: () => void) {
   const ul = $('people');
@@ -44,8 +45,8 @@ export function renderWorkers(onOpen: (id: string) => void) {
         'li',
         { onclick: () => onOpen(w.id), title: `Open ${w.name}'s terminal` },
         h('span.dot', { style: `background:${w.color}` }),
-        h('span.name', {}, w.name, sub ? h('span.sub', {}, sub) : null),
-        w.usage?.calls ? h('span.cost', { title: usageTitle(w.usage) }, fmtCost(w.usage.cost)) : null,
+        h('span.name', {}, workerBadge(w), w.name, sub ? h('span.sub', {}, sub) : null),
+        w.usage?.calls ? h('span.cost', { title: usageTitle(w.usage) }, fmtSpend(w.usage)) : null,
         h('span.pill', { class: w.status }, STATUS_LABEL[w.status] ?? w.status),
       ),
     );
@@ -79,7 +80,7 @@ export function openHelp() {
     ['T', 'Chat'],
     ['V / M', 'Join voice / mute'],
     ['Esc', 'Close any window and get back to looking around'],
-    ['Ctrl + [', 'Send Esc to a terminal (e.g. to interrupt Claude)'],
+    ['Ctrl + [', 'Send Esc to a terminal (e.g. to interrupt Claude; Cursor stops on Ctrl + C)'],
     ['⚙️', 'Settings: switch between first and third person'],
   ];
   const close = h('button.btn.close', { 'aria-label': 'Close' }, '✕');

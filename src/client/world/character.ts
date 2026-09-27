@@ -287,7 +287,35 @@ const TASK_CHIP: Record<string, [string, string, string]> = {
   offline: ['💤 ASLEEP', STATUS_BULB.offline, '#ffffff'],
 };
 
-/** The little Claude worker that sits at a desk. Forward is +z. */
+/** The mark pinned on a worker's chest that says which agent it runs. */
+export interface WorkerBadge {
+  text: string;
+  color: string;
+}
+
+/** A round pin with a short mark on it, as a texture. */
+function badgeTexture(b: WorkerBadge): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d')!;
+  g.beginPath();
+  g.arc(64, 64, 58, 0, Math.PI * 2);
+  g.fillStyle = b.color;
+  g.fill();
+  g.lineWidth = 10;
+  g.strokeStyle = '#fffaf3';
+  g.stroke();
+  g.fillStyle = '#fffaf3';
+  g.font = `900 ${b.text.length > 1 ? 50 : 64}px system-ui, sans-serif`;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(b.text, 64, 68);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+/** The little worker that sits at a desk. Forward is +z. */
 export class Worker {
   readonly root = new THREE.Group();
   private body = new THREE.Group();
@@ -307,8 +335,12 @@ export class Worker {
   bouncing = false;
   private bounceT = 0;
   private spawnT = 0;
+  private badge: { tex: THREE.CanvasTexture; mat: THREE.MeshBasicMaterial; geo: THREE.CircleGeometry } | null = null;
+  /** Name tag colour: the agent's, so a Claude worker and a Cursor one differ from across the room. */
+  private tagBg = '#2b2d42';
 
-  constructor(name: string, color: string) {
+  constructor(name: string, color: string, badge?: WorkerBadge) {
+    if (badge) this.tagBg = badge.color;
     const skin = toonUnique(color);
     const white = toon('#ffffff');
     const ink = toon('#1d1d1d');
@@ -348,6 +380,17 @@ export class Worker {
     this.armL = arm(-0.3);
     this.armR = arm(0.3);
     for (const sx of [-1, 1]) this.body.add(mesh(new THREE.CapsuleGeometry(0.06, 0.1, 4, 8), skin, sx * 0.12, 0.2, 0.05));
+    // Agent pin on the chest, like a name badge
+    if (badge) {
+      const tex = badgeTexture(badge);
+      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+      const geo = new THREE.CircleGeometry(0.075, 24);
+      const pin = new THREE.Mesh(geo, mat);
+      pin.position.set(0.13, 0.47, 0.262);
+      pin.rotation.y = 0.45;
+      this.body.add(pin);
+      this.badge = { tex, mat, geo };
+    }
 
     this.setName(name);
   }
@@ -357,7 +400,7 @@ export class Worker {
       this.root.remove(this.nameTag);
       disposeSprite(this.nameTag);
     }
-    this.nameTag = textSprite(name, { bg: '#2b2d42', color: '#fffaf3', size: 36, border: '#fffaf3' });
+    this.nameTag = textSprite(name, { bg: this.tagBg, color: '#fffaf3', size: 36, border: '#fffaf3' });
     this.nameTag.position.y = 1.55;
     this.root.add(this.nameTag);
   }
@@ -442,5 +485,10 @@ export class Worker {
   dispose() {
     if (this.bubble) disposeSprite(this.bubble);
     if (this.nameTag) disposeSprite(this.nameTag);
+    if (this.badge) {
+      this.badge.tex.dispose();
+      this.badge.mat.dispose();
+      this.badge.geo.dispose();
+    }
   }
 }

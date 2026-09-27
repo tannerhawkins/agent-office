@@ -32,6 +32,7 @@ import { openHelp, renderChat, renderPeople, renderWorkers, updateSpeaking } fro
 import { openCharacter } from './ui/character';
 import { openSettings } from './ui/settings';
 import { hiringPaused, renderUsage, usageLabel, usageTitle } from './ui/usage';
+import { agentLabel, agentOf, rememberedAgent } from './ui/agentpick';
 
 // ---- Renderer & scene ---------------------------------------------------------------------------
 const canvas = $('scene') as HTMLCanvasElement;
@@ -281,7 +282,8 @@ function renderProject() {
   const p = store.project;
   if (!p) return;
   $('project-name').textContent = `🏢 ${p.name}`;
-  $('project-meta').textContent = [p.branch && `⎇ ${p.branch}`, p.dir, `runs: ${p.agentCmd}`].filter(Boolean).join(' · ');
+  const runs = (p.agents ?? []).filter((a) => a.available).map((a) => (a.id === p.defaultAgent && p.agents.length > 1 ? `${a.label} (default)` : a.label));
+  $('project-meta').textContent = [p.branch && `⎇ ${p.branch}`, p.dir, `runs: ${runs.join(', ') || p.agentCmd}`].filter(Boolean).join(' · ');
   document.title = `${p.name} · Agent Office`;
   office.setProjectName(p.name);
 }
@@ -349,7 +351,8 @@ function syncWorkers() {
     const desk = office.desks.get(w.deskId);
     if (!desk) continue;
     if (!v) {
-      const model = new Worker(w.name, w.color);
+      const badge = w.kind === 'agent' && (store.project?.agents.length ?? 0) > 1 ? agentOf(w.agent) : undefined;
+      const model = new Worker(w.name, w.color, badge && { text: badge.badge, color: badge.badgeColor });
       model.root.position.copy(desk.seatAnchor.position);
       model.root.position.y = 0.4;
       model.root.position.z += 0.08;
@@ -419,8 +422,13 @@ function freeDesk(): string | null {
   return best;
 }
 
-function hire(deskId: string, prompt?: string, worktree = false) {
-  net.send({ t: 'worker.spawn', deskId, prompt, worktree });
+function hire(deskId: string, prompt?: string, worktree = false, agent = rememberedAgent()) {
+  net.send({ t: 'worker.spawn', deskId, prompt, worktree, agent });
+}
+
+/** What E at an empty desk does: hire the agent this person last picked. */
+function hireLabel() {
+  return (store.project?.agents.length ?? 0) > 1 ? `Hire ${agentLabel(rememberedAgent())}` : 'Hire a worker';
 }
 
 function openShell(deskId: string) {
@@ -433,10 +441,11 @@ function promptAtDesk(deskId: string) {
   if (!w) {
     openPrompt({
       title: `✨ New task at ${desk.label}`,
-      subtitle: 'A fresh Claude Code worker will sit down and start on this right away.',
+      subtitle: 'A fresh worker will sit down and start on this right away.',
       submitLabel: 'Hire & start',
       worktreeOption: !!store.project?.branch,
-      onSubmit: (text, o) => hire(deskId, text, o.worktree),
+      agentOption: true,
+      onSubmit: (text, o) => hire(deskId, text, o.worktree, o.agent),
     });
   } else if (w.status === 'exited' || w.status === 'offline') {
     toast(`${w.name} is asleep — press R to resume first`, 'warn');
@@ -472,13 +481,14 @@ function killWorker(id: string) {
     });
     return;
   }
-  confirmDialog(`Send ${w.name} home?`, `This stops the Claude Code session at ${where} for everyone and frees the desk.`, 'Send home', () =>
+  const what = w.kind === 'shell' ? 'shell' : `${agentLabel(w.agent)} session`;
+  confirmDialog(`Send ${w.name} home?`, `This stops the ${what} at ${where} for everyone and frees the desk.`, 'Send home', () =>
     net.send({ t: 'worker.kill', workerId: id }),
   );
 }
 
 function resumeWorker(w: WorkerInfo) {
-  if (!w.sessionId && w.kind !== 'shell') toast(`${w.name} has no saved Claude session — starting a fresh one`, 'warn');
+  if (!w.sessionId && w.kind !== 'shell') toast(`${w.name} has no saved ${agentLabel(w.agent)} session — starting a fresh one`, 'warn');
   net.send({ t: 'worker.resume', workerId: w.id });
 }
 
@@ -547,18 +557,18 @@ function sendToWorker(title: string, text: { context?: string; initial?: string 
     title,
     ...text,
     newDesk: desk ? DESK_BY_ID.get(desk)!.label : undefined,
-    workers: awake.map((w) => ({ id: w.id, name: w.name, color: w.color, status: w.status })),
+    workers: awake.map((w) => ({ id: w.id, name: w.name, color: w.color, status: w.status, agent: w.agent })),
     worktreeOption: !!store.project?.branch,
-    onSubmit: (prompt, to, worktree) => {
+    onSubmit: (prompt, to, worktree, agent) => {
       if (to) net.send({ t: 'worker.prompt', workerId: to, prompt });
-      else if (desk) hire(desk, prompt, worktree);
+      else if (desk) hire(desk, prompt, worktree, agent);
     },
   });
 }
 
 function boardActions() {
   return {
-    queue: (prompt: string, title: string, issue: number) => net.send({ t: 'queue.add', prompt, title, issue }),
+    queue: (prompt: string, title: string, issue: number) => net.send({ t: 'queue.add', prompt, title, issue, agent: rememberedAgent() }),
     assign: (prompt: string, title: string) => sendToWorker(`🤖 ${title}`, { initial: prompt }),
     ask: (context: string, title: string) => sendToWorker(`✍️ ${title}`, { context }),
     goToDesk,
@@ -645,10 +655,10 @@ function renderHint() {
     const desk = DESK_BY_ID.get(target.deskId)!;
     if (!w) {
       const paused = hiringPaused();
-      k += String(paused);
+      k += String(paused) + hireLabel();
       parts = [
         h('span.title', {}, `${desk.label} · empty`),
-        ...(paused ? [h('span.cost', {}, '💸 Budget spent — hiring resumes tomorrow')] : [key('E', 'Hire a worker'), key('P', 'Hire with a task')]),
+        ...(paused ? [h('span.cost', {}, '💸 Budget spent — hiring resumes tomorrow')] : [key('E', hireLabel()), key('P', 'Hire with a task')]),
         key('B', 'Shell'),
       ];
     } else {

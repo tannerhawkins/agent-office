@@ -1,5 +1,6 @@
-import type { WorkerStatus } from '../../shared/protocol';
+import type { AgentId, WorkerInfo, WorkerStatus } from '../../shared/protocol';
 import { h, openModal, STATUS_LABEL } from './dom';
+import { agentBadge, agentPicker } from './agentpick';
 
 // Send a prompt about an issue or PR to a worker: a new one at a free desk, or one already sitting
 // at a desk (it lands in their input box, queued if they're busy).
@@ -9,6 +10,7 @@ export interface AskWorker {
   name: string;
   color: string;
   status: WorkerStatus;
+  agent?: WorkerInfo['agent'];
 }
 
 export interface AskOptions {
@@ -23,8 +25,8 @@ export interface AskOptions {
   workers: AskWorker[];
   /** Offer the "own git worktree" option for a new worker. */
   worktreeOption: boolean;
-  /** `to` is a worker id, or null for a new worker. */
-  onSubmit(prompt: string, to: string | null, worktree: boolean): void;
+  /** `to` is a worker id, or null for a new worker (running `agent`). */
+  onSubmit(prompt: string, to: string | null, worktree: boolean, agent?: AgentId): void;
 }
 
 // Shared with the hire prompt, so the choice sticks either way.
@@ -40,6 +42,7 @@ export function openAsk(opts: AskOptions) {
   } catch {
     // storage blocked
   }
+  const picker = agentPicker();
   const wtRow = h('label.ask-wt', { for: 'ask-wt', title: 'Isolate the new worker on its own branch so parallel workers never collide' }, wtBox, '🌿 Work in its own git worktree & branch');
   const submit = h('button.btn.primary', { type: 'submit' });
 
@@ -48,11 +51,12 @@ export function openAsk(opts: AskOptions) {
     to = id;
     for (const b of choices.children) b.classList.toggle('on', (b as HTMLElement).dataset.to === (id ?? ''));
     wtRow.classList.toggle('hidden', !!id || !opts.worktreeOption);
+    picker.el.classList.toggle('off', !!id);
     submit.textContent = id ? 'Send ✨' : 'Hire & start';
   };
   if (opts.newDesk) choices.append(h('button.btn', { type: 'button', 'data-to': '', onclick: () => pick(null) }, `✨ New worker · ${opts.newDesk}`));
   for (const w of opts.workers) {
-    choices.append(h('button.btn', { type: 'button', 'data-to': w.id, title: `Type it into ${w.name}'s prompt`, onclick: () => pick(w.id) }, h('span.dot', { style: `background:${w.color}` }), w.name, h('small', {}, STATUS_LABEL[w.status] ?? w.status)));
+    choices.append(h('button.btn', { type: 'button', 'data-to': w.id, title: `Type it into ${w.name}'s prompt`, onclick: () => pick(w.id) }, h('span.dot', { style: `background:${w.color}` }), agentBadge(w.agent), w.name, h('small', {}, STATUS_LABEL[w.status] ?? w.status)));
   }
 
   const cancel = h('button.btn', { type: 'button' }, 'Cancel');
@@ -65,6 +69,7 @@ export function openAsk(opts: AskOptions) {
       {},
       h('label', {}, 'Send to'),
       choices,
+      picker.el,
       opts.context ? h('details.ask-context', {}, h('summary', {}, 'The worker is told first…'), h('pre', {}, opts.context)) : null,
       h('label', { style: 'margin-top:14px' }, 'Prompt'),
       ta,
@@ -90,7 +95,7 @@ export function openAsk(opts: AskOptions) {
         // storage blocked
       }
     }
-    opts.onSubmit(opts.context ? `${opts.context}\n\n${text}` : text, to, !to && opts.worktreeOption && wtBox.checked);
+    opts.onSubmit(opts.context ? `${opts.context}\n\n${text}` : text, to, !to && opts.worktreeOption && wtBox.checked, to ? undefined : picker.value());
   };
   form.addEventListener('submit', (e) => {
     e.preventDefault();

@@ -3,6 +3,7 @@ import type { Net } from '../net';
 import { store } from '../state';
 import { h, openModal, timeAgo, STATUS_LABEL } from './dom';
 import { confirmDialog } from './prompt';
+import { agentBadge, agentOptions, agentPicker } from './agentpick';
 
 export interface QueueActions {
   openTerminal(workerId: string): void;
@@ -65,13 +66,14 @@ export function openQueue(net: Net, actions: QueueActions) {
   const ta = h('textarea', { rows: 2, placeholder: 'Describe a task for the next free worker…', 'aria-label': 'New task' }) as HTMLTextAreaElement;
   const addBtn = h('button.btn.primary', { type: 'submit' }, 'Add to queue');
   const form = h('form.queue-add', {}, ta, addBtn) as HTMLFormElement;
+  const picker = agentPicker();
   const submit = () => {
     const text = ta.value.trim();
     if (!text) {
       ta.focus();
       return;
     }
-    net.send({ t: 'queue.add', prompt: text });
+    net.send({ t: 'queue.add', prompt: text, agent: picker.value() });
     ta.value = '';
   };
   form.addEventListener('submit', (e) => {
@@ -133,7 +135,7 @@ export function openQueue(net: Net, actions: QueueActions) {
       'li',
       { class: t.status },
       pos ? h('span.pos', {}, pos) : null,
-      h('div.queue-main', {}, taskTitle(t), h('div.queue-meta', {}, meta.join(' · '))),
+      h('div.queue-main', {}, agentOptions().length > 1 ? agentBadge(t.agent ?? store.project?.defaultAgent) : null, taskTitle(t), h('div.queue-meta', {}, meta.join(' · '))),
       h('div.queue-actions', {}, ...buttons),
     );
   };
@@ -147,6 +149,7 @@ export function openQueue(net: Net, actions: QueueActions) {
     const done = q.tasks.filter((t) => t.status === 'done').slice().reverse();
     const parts: (HTMLElement | null)[] = [
       form,
+      picker.el,
       h(
         'p.note',
         {},

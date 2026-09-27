@@ -1,5 +1,6 @@
-import type { ServerMsg, WorktreeCleanup, WorktreeState } from '../../shared/protocol';
+import type { AgentId, ServerMsg, WorktreeCleanup, WorktreeState } from '../../shared/protocol';
 import { h, openModal } from './dom';
+import { agentPicker } from './agentpick';
 
 export interface PromptOptions {
   title: string;
@@ -9,7 +10,9 @@ export interface PromptOptions {
   submitLabel?: string;
   /** Offer the "own git worktree" option (only when hiring a new worker). */
   worktreeOption?: boolean;
-  onSubmit(text: string, opts: { worktree: boolean }): void;
+  /** Offer the Claude / Cursor choice (only when hiring a new worker). */
+  agentOption?: boolean;
+  onSubmit(text: string, opts: { worktree: boolean; agent?: AgentId }): void;
 }
 
 const WT_KEY = 'agent-office.worktree';
@@ -22,7 +25,8 @@ function worktreePref(): boolean {
 }
 
 export function openPrompt(opts: PromptOptions) {
-  const ta = h('textarea', { rows: 7, placeholder: opts.placeholder ?? 'What should Claude work on?', 'aria-label': 'Prompt' }) as HTMLTextAreaElement;
+  const ta = h('textarea', { rows: 7, placeholder: opts.placeholder ?? 'What should the worker work on?', 'aria-label': 'Prompt' }) as HTMLTextAreaElement;
+  const picker = opts.agentOption ? agentPicker() : null;
   ta.value = opts.initial ?? '';
   const wtBox = h('input', { type: 'checkbox', id: 'wt-toggle' }) as HTMLInputElement;
   wtBox.checked = worktreePref();
@@ -40,7 +44,7 @@ export function openPrompt(opts: PromptOptions) {
     'form.modal',
     { role: 'dialog', 'aria-label': opts.title },
     h('header', {}, h('h2', {}, opts.title)),
-    h('div.body', {}, opts.subtitle ? h('p', { style: 'margin:0 0 10px;font-weight:700;color:var(--muted)' }, opts.subtitle) : null, ta, wtRow),
+    h('div.body', {}, opts.subtitle ? h('p', { style: 'margin:0 0 10px;font-weight:700;color:var(--muted)' }, opts.subtitle) : null, picker?.el, ta, wtRow),
     h('footer', {}, h('span.grow', {}, 'Enter to send · Shift+Enter for a new line'), cancel, submit),
   ) as HTMLFormElement;
 
@@ -60,7 +64,7 @@ export function openPrompt(opts: PromptOptions) {
         // storage blocked
       }
     }
-    opts.onSubmit(text, { worktree: !!opts.worktreeOption && wtBox.checked });
+    opts.onSubmit(text, { worktree: !!opts.worktreeOption && wtBox.checked, agent: picker?.value() });
   };
   form.addEventListener('submit', (e) => {
     e.preventDefault();

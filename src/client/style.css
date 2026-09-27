@@ -608,3 +608,18 @@ a.when:hover { text-decoration: underline; }
 @media (max-width: 640px) {
   .queue-limit span { display: none; }
 }
+
+/* Which agent a worker runs: the Claude / Cursor switch in hire dialogs, and the badge on workers */
+.agent-row { display: flex; gap: 10px; align-items: center; margin: 0 0 10px; }
+.agent-row > label { margin: 0; }
+.agent-row.off { display: none; }
+.modal .agent-row { margin-top: 10px; }
+.agent-pick .btn { display: inline-flex; gap: 6px; align-items: center; padding: 4px 10px; font-size: 13px; }
+.agent-pick .btn small { font-weight: 600; opacity: 0.7; }
+.agent-badge {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  min-width: 18px; height: 18px; padding: 0 4px; margin-right: 5px; border-radius: 9px;
+  color: #fffaf3; font-size: 10px; font-weight: 900; line-height: 1; vertical-align: middle;
+}
+.term header .agent-badge { margin-right: 0; }
+.queue-main .agent-badge { float: left; margin-top: 2px; }
