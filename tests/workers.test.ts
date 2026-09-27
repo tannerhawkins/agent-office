@@ -667,3 +667,109 @@ test('a board agent is hired with its brief on the first prompt, then prompted, 
   assert.ok(second.args.includes('--resume') && second.args.includes('issues-session'));
   assert.equal(second.args.at(-1), 'Close the duplicates');
 });
+
+test('Cursor workers run cursor-agent with the office plugin, follow its hooks and screen, count turns once, and resume', async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const oldLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => { if (oldLog === undefined) delete process.env.FAKE_AGENT_LOG; else process.env.FAKE_AGENT_LOG = oldLog; f.close(); });
+  writeFileSync(path.join(path.dirname(f.claude), 'cursor-agent'), fakeAgent, { mode: 0o700 });
+  const book = ledger(f.data);
+  const workers = new WorkerManager(f.root, f.data, f.claude, ['--claude-only'], { url: 'http://127.0.0.1:1', token: '' }, events([]), book);
+  t.after(() => workers.shutdown());
+  const worker = workers.spawn('desk-1', 'test', '- fix the login', false, 'agent', 'cursor');
+  assert.notEqual(typeof worker, 'string'); if (typeof worker === 'string') return;
+  const calls = await waitFor(f.read, x => x.some(r => r.kind === 'cursor-agent'));
+  const first = calls.find(r => r.kind === 'cursor-agent')!;
+  const token = first.env.hookToken!;
+  assert.equal(worker.provider, 'cursor');
+  assert.equal(worker.status, 'starting');
+  assert.deepEqual(first.args.slice(0, 2), ['--trust', '--plugin-dir']);
+  assert.ok(existsSync(path.join(first.args[2], 'hooks', 'hooks.json')));
+  assert.deepEqual(first.args.slice(-2), ['--', '- fix the login']);
+  assert.equal(first.args.some(a => /--claude-only|--settings/.test(a)), false);
+  assert.equal(calls.some(r => r.kind === 'claude' && !r.args.includes('--output-format')), false);
+
+  const hook = (event: string, extra = {}) => workers.handleCursorHook(worker.id, token, event, { conversation_id: 'chat-1', ...extra });
+  assert.equal(workers.handleCursorHook(worker.id, 'wrong', 'sessionStart', { conversation_id: 'chat-1' }), false);
+  assert.equal(workers.handleHook(worker.id, token, 'Stop', { session_id: 'chat-1' }), false);
+  assert.equal(workers.handleCodexHook(worker.id, token, 'Stop', { session_id: 'chat-1' }), false);
+  assert.equal(hook('sessionStart'), true);
+  assert.equal(worker.status, 'idle');
+  assert.equal(worker.sessionId, 'chat-1');
+  assert.equal(hook('beforeSubmitPrompt', { prompt: 'Fix the login redirect' }), true);
+  assert.equal(worker.status, 'working');
+  assert.equal(worker.activity, 'Fix the login redirect');
+  assert.equal(hook('preToolUse', { tool_name: 'Shell', tool_input: { command: 'npm test' } }), true);
+  assert.equal(worker.activity, 'Shell: npm test');
+  const stop = { generation_id: 'gen-1', status: 'completed', model: 'gpt-5.5', input_tokens: 1200, output_tokens: 100, cache_read_tokens: 200, cache_write_tokens: 0 };
+  assert.equal(hook('stop', stop), true);
+  assert.equal(hook('stop', stop), true);
+  assert.equal(worker.status, 'done');
+  assert.equal(worker.usage?.input, 1000);
+  assert.equal(worker.usage?.calls, 1);
+  assert.equal(worker.usage?.costKnown, true);
+  // Like OpenCode and Codex, Cursor spend stays out of the Claude ledger and budget.
+  assert.equal(book.state().total.calls, 0);
+  assert.equal(hook('stop', { status: 'aborted' }), true);
+  assert.equal(worker.usage?.calls, 1);
+
+  workers.shutdown();
+  const restored = manager(f, f.claude, [], []);
+  t.after(() => restored.shutdown());
+  await restored.start();
+  assert.equal(restored.get(worker.id)?.provider, 'cursor');
+  assert.deepEqual(restored.get(worker.id)?.usage, worker.usage);
+  const nextCalls = await waitFor(f.read, x => x.filter(r => r.kind === 'cursor-agent' && !r.stdin).length >= 2);
+  const next = nextCalls.filter(r => r.kind === 'cursor-agent' && !r.stdin).at(-1)!;
+  assert.deepEqual(next.args.slice(-2), ['--resume', 'chat-1']);
+  assert.notEqual(next.env.hookToken, token);
+  assert.equal(restored.handleCursorHook(worker.id, token, 'stop', { conversation_id: 'chat-1' }), false);
+  // A new conversation in the same terminal starts the totals over.
+  assert.equal(restored.handleCursorHook(worker.id, next.env.hookToken!, 'sessionStart', { conversation_id: 'chat-2' }), true);
+  assert.equal(restored.get(worker.id)?.usage, undefined);
+  assert.equal(restored.get(worker.id)?.sessionId, 'chat-2');
+});
+
+test("Cursor's screen says when it's ready and when a tool waits for approval", async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  t.after(() => f.close());
+  // Draws what Cursor draws: its prompt bar, then (on "ask") the approval box, cleared again on "y".
+  const tokenFile = path.join(f.root, 'cursor-token');
+  const fakeCursor = `#!/usr/bin/env node
+require('node:fs').writeFileSync(${JSON.stringify(tokenFile)}, process.env.AGENT_OFFICE_HOOK_TOKEN || '');
+process.stdout.write('\\r\\n  → Plan, search, build anything\\r\\n');
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (d) => {
+  if (d.includes('ask')) process.stdout.write('\\x1b[2J\\x1b[H  $ rm junk.txt Waiting for approval...\\r\\n Run this command?\\r\\n  → Run (once) (y)\\r\\n');
+  if (d.includes('y')) process.stdout.write('\\x1b[2J\\x1b[H  $ rm junk.txt 218ms\\r\\n  Running  89 tokens\\r\\n');
+});
+process.stdin.resume();
+`;
+  writeFileSync(path.join(path.dirname(f.claude), 'cursor-agent'), fakeCursor, { mode: 0o700 });
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  const worker = workers.spawn('desk-1', 'test', undefined, false, 'agent', 'cursor');
+  assert.notEqual(typeof worker, 'string'); if (typeof worker === 'string') return;
+  // No hook fires until the first prompt: the prompt bar on screen is what says it's ready.
+  await waitFor(() => workers.get(worker.id)?.status, s => s === 'idle');
+  const token = readFileSync(tokenFile, 'utf8');
+  const hook = (event: string, extra = {}) => workers.handleCursorHook(worker.id, token, event, { conversation_id: 'chat-1', ...extra });
+  assert.equal(hook('beforeSubmitPrompt', { prompt: 'Clean up' }), true);
+  assert.equal(hook('preToolUse', { tool_name: 'Shell', tool_input: { command: 'rm junk.txt' } }), true);
+  assert.equal(workers.get(worker.id)?.status, 'working');
+  // Cursor has no hook for an approval prompt: seeing it on screen means it needs a human.
+  workers.write(worker.id, 'ask\r', 'test');
+  await waitFor(() => workers.get(worker.id)?.status, s => s === 'needs_input');
+  assert.equal(workers.get(worker.id)?.activity, 'Wants permission: Shell: rm junk.txt');
+  // A tool starting elsewhere in the meantime doesn't hide the open prompt.
+  assert.equal(hook('preToolUse', { tool_name: 'Read', tool_input: { path: 'a.ts' } }), true);
+  assert.equal(workers.get(worker.id)?.status, 'needs_input');
+  // Approved: the prompt goes away and it carries on.
+  workers.write(worker.id, 'y\r', 'test');
+  await waitFor(() => workers.get(worker.id)?.status, s => s === 'working');
+  assert.equal(hook('stop', { status: 'completed' }), true);
+  assert.equal(workers.get(worker.id)?.status, 'done');
+});

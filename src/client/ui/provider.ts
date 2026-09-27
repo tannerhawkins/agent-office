@@ -7,12 +7,13 @@ export const PROVIDER_LABEL: Record<AgentProvider, string> = {
   claude: 'Claude Code',
   opencode: 'OpenCode',
   codex: 'Codex',
+  cursor: 'Cursor',
   custom: 'Custom',
 };
 
 /** Providers the server says this project can start. */
 export function supportedProviders(project: ProjectInfo | null): AgentProvider[] {
-  const values = project?.agentProviders?.filter((p): p is AgentProvider => p === 'claude' || p === 'opencode' || p === 'codex' || p === 'custom') ?? [];
+  const values = project?.agentProviders?.filter((p): p is AgentProvider => p === 'claude' || p === 'opencode' || p === 'codex' || p === 'cursor' || p === 'custom') ?? [];
   if (values.length) return [...new Set(values)];
   return project?.defaultProvider && PROVIDER_LABEL[project.defaultProvider] ? [project.defaultProvider] : ['claude'];
 }
@@ -32,7 +33,7 @@ export function providerLabel(provider: AgentProvider | undefined, project: Proj
 
 export function providerUsageTracked(provider: AgentProvider | undefined, project: ProjectInfo | null, usage?: Usage): boolean {
   const selected = resolvedProvider(provider, project);
-  return selected === 'claude' || ((selected === 'opencode' || selected === 'codex' || selected === 'custom') && usage !== undefined);
+  return selected === 'claude' || ((selected === 'opencode' || selected === 'codex' || selected === 'cursor' || selected === 'custom') && usage !== undefined);
 }
 
 export type ProviderUsageState = 'tracked' | 'waiting' | 'untracked';
@@ -43,6 +44,7 @@ export function providerUsageState(provider: AgentProvider | undefined, project:
   if (selected === 'claude') return usage ? 'tracked' : 'waiting';
   if (selected === 'opencode') return usage ? 'tracked' : 'waiting';
   if (selected === 'codex') return usage ? 'tracked' : 'waiting';
+  if (selected === 'cursor') return usage ? 'tracked' : 'waiting';
   if (selected === 'custom') return usage ? 'tracked' : 'untracked';
   return 'untracked';
 }
@@ -51,6 +53,7 @@ export function providerUsageNote(provider: AgentProvider): string {
   if (provider === 'claude') return 'Office usage and budget track Claude Code.';
   if (provider === 'codex') return 'Review Office hooks in /hooks to enable tracking. Codex reports root-session tokens; subagents are excluded and cost is unavailable.';
   if (provider === 'custom') return 'Usage is untracked unless compatible Claude Code hooks report it.';
+  if (provider === 'cursor') return "Runs cursor-agent. Cursor reports each turn's tokens; the cost is an office estimate from list prices, not billing.";
   return 'OpenCode reports model/provider estimates; they are not billing, and arrive after the first report.';
 }
 

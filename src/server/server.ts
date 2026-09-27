@@ -233,7 +233,7 @@ export async function startServer(cfg: Config) {
       return send(res, 400, {});
     }
     if (url.pathname === '/office/queue') return officeQueue(req, res, url);
-    if (req.method !== 'POST' || !['/hooks/claude', '/hooks/opencode', '/hooks/codex'].includes(url.pathname)) return send(res, 404, { ok: false });
+    if (req.method !== 'POST' || !['/hooks/claude', '/hooks/opencode', '/hooks/codex', '/hooks/cursor'].includes(url.pathname)) return send(res, 404, { ok: false });
     let payload: unknown = {};
     try {
       const body = await readBody(req);
@@ -250,7 +250,9 @@ export async function startServer(cfg: Config) {
       ? workers.handleOpenCodeHook(workerId, token, payload)
       : url.pathname === '/hooks/codex'
         ? workers.handleCodexHook(workerId, token, url.searchParams.get('event') ?? '', payload)
-        : workers.handleHook(workerId, token, url.searchParams.get('event') ?? '', payload);
+        : url.pathname === '/hooks/cursor'
+          ? workers.handleCursorHook(workerId, token, url.searchParams.get('event') ?? '', payload)
+          : workers.handleHook(workerId, token, url.searchParams.get('event') ?? '', payload);
     send(res, ok ? 200 : 401, {});
   });
   /**

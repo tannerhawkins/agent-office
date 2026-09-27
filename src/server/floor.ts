@@ -60,7 +60,7 @@ export function projectInfo(dir: string, name: string, agentCmd: string, agentAr
     remote: git(['remote', 'get-url', 'origin']),
     agentCmd: [agentCmd, ...agentArgs].join(' '),
     defaultProvider: configuredProvider(agentCmd),
-    agentProviders: configuredProvider(agentCmd) === 'custom' ? ['claude', 'opencode', 'codex', 'custom'] : ['claude', 'opencode', 'codex'],
+    agentProviders: configuredProvider(agentCmd) === 'custom' ? ['claude', 'opencode', 'codex', 'cursor', 'custom'] : ['claude', 'opencode', 'codex', 'cursor'],
   };
 }
 

@@ -19,7 +19,8 @@ import { addUsage, newTracker, restoreTracker, scanTracker, trackerUsage, zeroUs
 import { PtyHost, SCROLLBACK, type Adopted, type Pty } from './ptys.js';
 import { codexHookArgs, normalizeCodexHook, writeCodexHook } from './codex.js';
 import { reportedUsage } from './reported-usage.js';
-import { configuredProvider, isValidOpenCodeModel, validateWorkerModel } from './agents.js';
+import { configuredProvider, isValidOpenCodeModel, providerCommand, validateWorkerModel } from './agents.js';
+import { CURSOR_APPROVAL, CURSOR_LOGGED_OUT, CURSOR_READY, CURSOR_SETUP, CURSOR_TITLE, cursorArgs, normalizeCursorHook, writeCursorPlugin } from './cursor.js';
 import { mergeOpenCodeConfigContent, openCodePluginSpecifier, writeOpenCodePlugin, type OpenCodeStatusEvent } from './opencode.js';
 import { ScrollbackStore, searchTerminal, terminalTail } from './history.js';
 
@@ -96,6 +97,12 @@ interface Worker {
   codexTools: Map<string, string>;
   codexPending: Set<string>;
   codexPermissionUnknown?: boolean;
+  /** Cursor turns whose tokens are already counted (its stop hook can arrive twice). */
+  cursorTurns: string[];
+  /** Cursor's approval prompt is on screen: it's waiting on a human (Cursor has no hook for that). */
+  cursorApproval?: boolean;
+  /** Its latest tool, to say what an approval prompt is about. */
+  lastTool?: string;
   /** Its latest prompts and tool calls, for naming its task. */
   prompts: string[];
   tools: string[];
@@ -131,6 +138,7 @@ export class WorkerManager {
   readonly defaultProvider: AgentProvider;
   private openCodePlugin: string;
   private codexHook: string;
+  private cursorPlugin: string;
   private screenTimer: NodeJS.Timeout;
   /** The office is shutting down: workers exiting now are being stopped, not failing to resume. */
   private closing = false;
@@ -158,6 +166,7 @@ export class WorkerManager {
     this.writeHookSettings();
     this.openCodePlugin = writeOpenCodePlugin(dataDir);
     this.codexHook = writeCodexHook(dataDir);
+    this.cursorPlugin = writeCursorPlugin(dataDir);
     this.agentPath = resolveCommand(agentCmd);
     const claude = this.defaultProvider === 'claude' ? this.agentPath : resolveCommand('claude');
     this.namer = new TaskNamer(claude, childEnv(), (id, task, ctx) => {
@@ -678,6 +687,67 @@ export class WorkerManager {
     return true;
   }
 
+  /** Cursor plugin callback (see cursor.ts). */
+  handleCursorHook(workerId: string, token: string, event: string, payload: unknown): boolean {
+    const w = this.workers.get(workerId);
+    if (!w || !w.pty || w.info.kind !== 'agent' || w.info.provider !== 'cursor' || !safeEq(token, w.hookToken)) return false;
+    const report = normalizeCursorHook(event, payload);
+    if (!report) return false;
+    // Another conversation in the same terminal (/new): a new task and fresh totals.
+    if (w.info.sessionId !== report.sessionId) {
+      if (w.info.sessionId) {
+        this.clearTask(w);
+        w.info.usage = undefined;
+        w.cursorTurns = [];
+      }
+      w.info.sessionId = report.sessionId;
+      this.persist();
+    }
+    w.bootBlocked = false;
+    switch (report.event) {
+      case 'sessionStart':
+        if (w.info.status === 'starting') this.setStatus(w, 'idle');
+        break;
+      case 'beforeSubmitPrompt':
+        w.cursorApproval = false;
+        if (report.prompt) {
+          w.info.activity = truncate(report.prompt, 80);
+          this.notePrompt(w, report.prompt);
+        }
+        this.setStatus(w, 'working');
+        break;
+      case 'preToolUse':
+      case 'afterFileEdit':
+        if (report.tool) {
+          w.info.activity = truncate(report.tool, 80);
+          w.lastTool = report.tool;
+        }
+        if (!w.cursorApproval) this.setStatus(w, 'working');
+        break;
+      case 'postToolUse':
+      case 'postToolUseFailure':
+        if (w.cursorApproval) {
+          w.cursorApproval = false;
+          w.leftNeedsInputAt = Date.now();
+        }
+        this.setStatus(w, 'working');
+        break;
+      case 'stop':
+        w.cursorApproval = false;
+        if (report.usage && !(report.generationId && w.cursorTurns.includes(report.generationId))) {
+          if (report.generationId) w.cursorTurns = [...w.cursorTurns, report.generationId].slice(-50);
+          // A running total of reported turns. Like the other non-Claude providers, it stays out of the office budget.
+          w.info.usage = addUsage(w.info.usage ?? zeroUsage(), report.usage);
+          w.info.usage.costKnown = true;
+        }
+        this.setStatus(w, 'done');
+        break;
+    }
+    this.emitUpdate(w);
+    this.persist();
+    return true;
+  }
+
   /** OpenCode plugin callback. The plugin has already filtered child sessions before this bridge. */
   handleOpenCodeHook(workerId: string, token: string, payload: unknown): boolean {
     const w = this.workers.get(workerId);
@@ -815,6 +885,7 @@ export class WorkerManager {
     const isClaude = !isShell && provider === 'claude';
     const isOpenCode = !isShell && provider === 'opencode';
     const isCodex = !isShell && provider === 'codex';
+    const isCursor = !isShell && provider === 'cursor';
     const configured = !isShell && provider === this.defaultProvider;
     const command = this.command(info);
     const commandPath = isShell ? undefined : configured ? this.agentPath : resolveCommand(command);
@@ -833,13 +904,16 @@ export class WorkerManager {
       args.push(...codexHookArgs(this.codexHook), '--no-alt-screen');
       if (resumeSessionId) args.push('resume', resumeSessionId);
       if (prompt) args.push('--', prompt);
+    } else if (isCursor) {
+      args = cursorArgs(this.cursorPlugin, args, resumeSessionId, prompt);
     }
+    if (isCursor) w.cursorApproval = false;
     if (isCodex) {
       w.codexTools.clear();
       w.codexPending.clear();
       w.codexPermissionUnknown = false;
     }
-    if (isOpenCode || isCodex) {
+    if (isOpenCode || isCodex || isCursor) {
       w.hookToken = randomBytes(16).toString('hex');
       w.openCodeError = false;
     }
@@ -876,7 +950,8 @@ export class WorkerManager {
       this.startFailed(w, (err as Error).message);
       return;
     }
-    if (!isClaude && !isCodex) info.status = 'idle';
+    // Claude, Codex and Cursor say when they can take input (a hook, or Cursor's prompt bar on screen).
+    if (!isClaude && !isCodex && !isCursor) info.status = 'idle';
     this.follow(w, proc, term, resumeSessionId);
     this.emitUpdate(w);
     this.persist();
@@ -933,7 +1008,7 @@ export class WorkerManager {
 
   private setTitle(w: Worker, title: string) {
     const clean = title.replace(/^[^\p{L}\p{N}]+/u, '').trim();
-    if (clean && clean !== w.info.title && !/^claude( code)?$/i.test(clean)) {
+    if (clean && clean !== w.info.title && !/^claude( code)?$/i.test(clean) && !CURSOR_TITLE.test(clean)) {
       w.info.title = clean;
       this.emitUpdate(w);
     }
@@ -944,6 +1019,7 @@ export class WorkerManager {
     const { info } = w;
     const isClaude = info.kind === 'agent' && info.provider === 'claude';
     const isCodex = info.kind === 'agent' && info.provider === 'codex';
+    const isCursor = info.kind === 'agent' && info.provider === 'cursor';
     w.pty = proc;
     proc.onData((data) => {
       term.write(data);
@@ -986,7 +1062,7 @@ export class WorkerManager {
     // blocked on a human: folder trust dialog, login, first-run onboarding. Flag it so it jumps.
     setTimeout(() => {
       if (info.status !== 'starting' || w.pty !== proc) return;
-      if (isClaude || isCodex) {
+      if (isClaude || isCodex || isCursor) {
         w.bootBlocked = true;
         info.activity = isCodex
           ? 'Open the terminal: complete login and review Office hooks in /hooks'
@@ -1012,7 +1088,8 @@ export class WorkerManager {
   /** What a worker's terminal runs: the shell, the configured agent command, or another provider's CLI. */
   private command(info: WorkerInfo): string {
     if (info.kind === 'shell') return process.env.SHELL || '/bin/bash';
-    return info.provider === this.defaultProvider ? this.agentCmd : info.provider ?? this.agentCmd;
+    if (info.provider === this.defaultProvider || !info.provider) return this.agentCmd;
+    return providerCommand(info.provider);
   }
 
   private cwd(info: WorkerInfo): string {
@@ -1120,6 +1197,7 @@ export class WorkerManager {
    * in on this machine. Flag that as needing a human, and clear it once the screen moves on.
    */
   private checkBlocked(w: Worker) {
+    if (w.info.kind === 'agent' && w.info.provider === 'cursor') return this.checkCursorScreen(w);
     if (w.info.kind !== 'agent' || !w.term || (w.info.provider !== 'claude' && w.info.provider !== 'custom')) return;
     const s = w.info.status;
     if (s !== 'starting' && s !== 'idle' && !(w.bootBlocked && s === 'needs_input')) return;
@@ -1136,6 +1214,46 @@ export class WorkerManager {
     } else if (!blocked && w.bootBlocked && s === 'needs_input') {
       w.bootBlocked = false;
       w.info.activity = undefined;
+      this.setStatus(w, 'idle');
+    }
+  }
+
+  /**
+   * Cursor's screen says what its hooks don't: that it's up and taking input, stuck on a trust or
+   * login screen, or waiting for someone to approve a tool.
+   */
+  private checkCursorScreen(w: Worker) {
+    if (!w.term) return;
+    const s = w.info.status;
+    const text = screenText(w.term, w.term.buffer.active.type === 'normal' ? Math.max(0, w.fresh?.line ?? 0) : 0);
+    // Only the bottom of what's drawn holds the prompt bar or an open approval: older output doesn't count.
+    const bottom = text.replace(/\s+$/, '').split('\n').slice(-16).join('\n');
+    if (s === 'working' || w.cursorApproval) {
+      const open = CURSOR_APPROVAL.test(bottom);
+      if (open && !w.cursorApproval) {
+        w.cursorApproval = true;
+        w.info.activity = `Wants permission: ${w.lastTool ?? 'a tool'}`;
+        this.setStatus(w, 'needs_input');
+      } else if (!open && w.cursorApproval) {
+        w.cursorApproval = false;
+        if (s === 'needs_input') this.setStatus(w, 'working');
+      }
+      return;
+    }
+    if (s !== 'starting' && s !== 'idle' && !(w.bootBlocked && s === 'needs_input')) return;
+    const loggedOut = CURSOR_LOGGED_OUT.test(text);
+    const blocked = loggedOut || (CURSOR_SETUP.test(text) && (s === 'starting' || w.bootBlocked));
+    if (blocked && s !== 'needs_input') {
+      w.bootBlocked = true;
+      w.info.activity = loggedOut
+        ? "Cursor isn't signed in on this machine — open the terminal and follow the login link"
+        : 'Waiting on a setup prompt (trust / login) — open the terminal';
+      this.setStatus(w, 'needs_input');
+    } else if (!blocked && w.bootBlocked && s === 'needs_input') {
+      w.bootBlocked = false;
+      w.info.activity = undefined;
+      this.setStatus(w, 'idle');
+    } else if (!blocked && s === 'starting' && CURSOR_READY.test(bottom)) {
       this.setStatus(w, 'idle');
     }
   }
@@ -1214,7 +1332,7 @@ process.stdin.on('end', () => {
       task: info.task,
       pr: info.pr,
       tracker: info.kind === 'agent' ? tracker : undefined,
-      usage: info.provider === 'opencode' || info.provider === 'codex' ? info.usage : undefined,
+      usage: info.provider === 'opencode' || info.provider === 'codex' || info.provider === 'cursor' ? info.usage : undefined,
       codexTranscript: info.provider === 'codex' ? codexTranscript : undefined,
       // A terminal still running in the host, to pick back up after a restart. Its hooks keep the token.
       hookToken,
@@ -1236,7 +1354,7 @@ process.stdin.on('end', () => {
         const tracker = restoreTracker(s.tracker);
         const provider = s.kind === 'shell'
           ? undefined
-          : s.provider === 'claude' || s.provider === 'opencode' || s.provider === 'codex' || s.provider === 'custom'
+          : s.provider === 'claude' || s.provider === 'opencode' || s.provider === 'codex' || s.provider === 'cursor' || s.provider === 'custom'
             ? s.provider
             : tracker.transcript
               ? 'claude'
@@ -1260,7 +1378,7 @@ process.stdin.on('end', () => {
           activity: s.activity,
           task: validTask(s.task),
           pr: s.pr && typeof s.pr.number === 'number' && typeof s.pr.url === 'string' ? { number: s.pr.number, url: s.pr.url } : undefined,
-          usage: provider === 'opencode' || provider === 'codex' ? reportedUsage(s.usage) : (provider === 'claude' || provider === 'custom') && tracker.transcript ? trackerUsage(tracker) : undefined,
+          usage: provider === 'opencode' || provider === 'codex' || provider === 'cursor' ? reportedUsage(s.usage) : (provider === 'claude' || provider === 'custom') && tracker.transcript ? trackerUsage(tracker) : undefined,
           cols: 100,
           rows: 30,
           viewers: [],
@@ -1295,6 +1413,7 @@ function newWorker(info: WorkerInfo, tracker: UsageTracker, hookToken = randomBy
     codexUsage: new CodexUsageReader(),
     codexTools: new Map(),
     codexPending: new Set(),
+    cursorTurns: [],
     prompts: [],
     tools: [],
     toolsSinceNamed: 0,

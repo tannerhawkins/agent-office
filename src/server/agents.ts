@@ -13,7 +13,13 @@ export function configuredProvider(command: string): AgentProvider {
   if (base === 'claude') return 'claude';
   if (base === 'opencode') return 'opencode';
   if (base === 'codex') return 'codex';
+  if (base === 'cursor-agent') return 'cursor';
   return 'custom';
+}
+
+/** The CLI a provider runs when it isn't the configured --agent. Cursor's is not called `cursor`: that opens the editor. */
+export function providerCommand(provider: AgentProvider): string {
+  return provider === 'cursor' ? 'cursor-agent' : provider;
 }
 
 /** OpenCode model ids are argv values, so reject anything that could be ambiguous or unsafe. */

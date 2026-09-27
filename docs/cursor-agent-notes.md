@@ -1,6 +1,6 @@
 # Cursor CLI notes
 
-These notes come from a spike run on 2026-09-26 against `cursor-agent` v2026.09.23 / v2026.09.26, driven in a PTY the same way the office drives workers. They record what the Cursor adapter (`src/server/agents/cursor.ts`) depends on. If Cursor changes any of this, the adapter needs updating to match.
+These notes come from a spike run on 2026-09-26 against `cursor-agent` v2026.09.23 / v2026.09.26, driven in a PTY the same way the office drives workers. They record what the Cursor adapter (`src/server/cursor.ts` and `handleCursorHook` in `src/server/workers.ts`) depends on. If Cursor changes any of this, the adapter needs updating to match.
 
 ## Hooks
 - **They load per process with `--plugin-dir <dir>`.** Cursor reads `<dir>/hooks/hooks.json` if there is also a `<dir>/.cursor-plugin/plugin.json` manifest (`{"name","description","version","author":{"name"}}`). A `hooks.json` at the plugin root is ignored. This means the office never has to edit `~/.cursor/hooks.json`.

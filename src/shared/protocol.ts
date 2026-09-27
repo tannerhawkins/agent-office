@@ -17,10 +17,10 @@ export type WorkerStatus =
 
 export type WorkerKind = 'agent' | 'shell';
 
-export type AgentProvider = 'claude' | 'opencode' | 'codex' | 'custom';
+export type AgentProvider = 'claude' | 'opencode' | 'codex' | 'cursor' | 'custom';
 
 export function isAgentProvider(value: unknown): value is AgentProvider {
-  return value === 'claude' || value === 'opencode' || value === 'codex' || value === 'custom';
+  return value === 'claude' || value === 'opencode' || value === 'codex' || value === 'cursor' || value === 'custom';
 }
 
 /** What a worker is on, for the card above its head: "Fix Login Redirect" + what it's doing now. */

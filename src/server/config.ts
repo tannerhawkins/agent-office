@@ -34,7 +34,7 @@ export interface Config {
   iceServers: RTCIceServerLike[];
   /** Address teammates SSH-tunnel to (set by deploy/aws.sh); enables invites from the office. */
   publicHost?: string;
-  /** Daily tracked Claude Code spend budget, USD. OpenCode/Codex spend is excluded. */
+  /** Daily tracked Claude Code spend budget, USD. OpenCode/Codex/Cursor spend is excluded. */
   budget?: number;
   /** Refuse new hires for the rest of the day once the budget is spent. */
   budgetPause: boolean;
@@ -52,7 +52,7 @@ export interface RTCIceServerLike {
   credential?: string;
 }
 
-const HELP = `agent-office — a 3D office for your team and its Claude Code / OpenCode / Codex workers
+const HELP = `agent-office — a 3D office for your team and its Claude Code / OpenCode / Codex / Cursor workers
 
 Usage:
   agent-office [options]
@@ -93,7 +93,8 @@ Options:
                           next start) and exit
       --agent <cmd>       Default agent command (default "claude", env AGENT_OFFICE_AGENT)
       --agent-args <str>  Extra args for the configured agent, e.g. "--model opus"
-                          Workers can also select Claude Code, OpenCode or Codex in the UI
+                          (claude, opencode, codex or cursor-agent). Workers can also
+                          select Claude Code, OpenCode, Codex or Cursor in the UI
       --tls-cert <file>   Serve HTTPS with this certificate (PEM)
       --tls-key <file>    ...and this private key (PEM)
       --self-signed       Serve HTTPS with a generated self-signed certificate
@@ -102,7 +103,7 @@ Options:
                           turn:user:pass@turn.example.com:3478
       --budget <usd>      Daily budget for tracked Claude Code spend (env
                           AGENT_OFFICE_BUDGET). Everyone is warned when the
-                          day's spend passes it. OpenCode/Codex spend is excluded
+                          day's spend passes it. OpenCode/Codex/Cursor spend is excluded
       --budget-pause      ...and no new workers can be hired until the next
                           day (env AGENT_OFFICE_BUDGET_PAUSE=1)
       --webhook <url>     Post to this Slack or Discord webhook when a worker

@@ -26,7 +26,9 @@ export function usageLabel(u: Usage, provider: AgentProvider = 'claude'): string
     ? 'cost unavailable'
     : u.costKnown === false
       ? 'cost unavailable'
-      : `${fmtCost(u.cost)}${provider === 'opencode' ? ' reported' : ''}`;
+      : provider === 'cursor'
+        ? `~${fmtCost(u.cost)} est.`
+        : `${fmtCost(u.cost)}${provider === 'opencode' ? ' reported' : ''}`;
   return `${u.incomplete ? "Partial: " : ""}${money} · ${fmtTokens(tokensOf(u))} tokens`;
 }
 
@@ -44,7 +46,9 @@ export function usageTitle(u: Usage, provider: AgentProvider = 'claude'): string
       ? `Codex root-session metrics; subagent usage is not included; ${money}; ${calls}`
       : provider === 'opencode'
         ? `OpenCode reported estimate ${money}; model/provider estimate, not billing; ${calls}`
-        : `${money} over ${calls}`,
+        : provider === 'cursor'
+          ? `Cursor tokens as reported per turn; ~${money} is an office estimate from list prices, not billing; ${u.calls} turn${u.calls === 1 ? '' : 's'}`
+          : `${money} over ${calls}`,
     `input ${fmtTokens(u.input)} · output ${fmtTokens(u.output)}`,
     `reasoning ${fmtTokens(u.reasoning ?? 0)}`,
     `cache write ${fmtTokens(u.cacheWrite)} · cache read ${fmtTokens(u.cacheRead)}`,
@@ -85,6 +89,10 @@ export function renderUsage() {
   let currentCodexCostUnknown = false;
   let currentCodexIncomplete = false;
   let codexWaiting = false;
+  let currentCursorCost = 0;
+  let currentCursorTokens = 0;
+  let currentCursorReports = 0;
+  let cursorWaiting = false;
   let untracked = false;
   for (const w of store.workers.values()) {
     if (w.kind !== 'agent') continue;
@@ -123,14 +131,23 @@ export function renderUsage() {
       if (w.usage.costKnown !== true) currentCodexCostUnknown = true;
       else currentCodexCost += w.usage.cost;
     }
+    if (provider === 'cursor') {
+      if (!w.usage) {
+        cursorWaiting = true;
+        continue;
+      }
+      currentCursorReports++;
+      currentCursorTokens += tokensOf(w.usage);
+      currentCursorCost += w.usage.cost;
+    }
     if (providerUsageTracked(provider, store.project, w.usage) && w.usage?.costKnown !== false && !w.usage?.incomplete) now += w.usage?.cost ?? 0;
   }
   const head = $('workers-cost');
   head.textContent = now > 0 ? fmtCost(now) : '';
-  head.title = 'Current desks: tracked Claude Code costs plus reported OpenCode estimates; Codex root-session tokens appear below; sessions with unavailable cost or partial history are excluded.';
+  head.title = 'Current desks: tracked Claude Code costs plus reported OpenCode and estimated Cursor costs; Codex root-session tokens appear below; sessions with unavailable cost or partial history are excluded.';
 
   const el = $('usage');
-  const any = s.total.calls > 0 || s.budget !== undefined || untracked || currentOpenCodeReports > 0 || openCodeWaiting || currentCodexReports > 0 || codexWaiting;
+  const any = s.total.calls > 0 || s.budget !== undefined || untracked || currentOpenCodeReports > 0 || openCodeWaiting || currentCodexReports > 0 || codexWaiting || currentCursorReports > 0 || cursorWaiting;
   el.classList.toggle('hidden', !any);
   if (!any) return;
   const over = overBudget();
@@ -189,6 +206,16 @@ export function renderUsage() {
     );
   }
   if (codexWaiting) rows.push(h('div.row.muted', { title: 'Codex usage appears after its first root-session metrics report; subagent usage is not included.' }, 'Codex metrics waiting for first report'));
+  if (currentCursorReports > 0) {
+    rows.push(
+      h(
+        'div.row.muted',
+        { title: "Cursor reports each turn's tokens; the cost is an office estimate from list prices, not billing, and stays out of the budget." },
+        `Cursor current desks ~${fmtCost(currentCursorCost)} est. · ${fmtTokens(currentCursorTokens)} tokens`,
+      ),
+    );
+  }
+  if (cursorWaiting) rows.push(h('div.row.muted', { title: "Cursor usage appears when its first turn ends." }, 'Cursor metrics waiting for first turn'));
   if (untracked) {
     rows.push(h('div.row.muted', { title: 'Custom provider usage is not reported by the office.' }, 'Custom usage untracked · budget and totals cover Claude Code only'));
   }
