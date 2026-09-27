@@ -19,6 +19,8 @@ import { TaskQueue } from './queue.js';
 import { Changes } from './changes.js';
 import { RELAY_LOGIN, relayRequest, relayUpgrade, signInPage, stoppedPage, tunneledPort } from './relay.js';
 import type { ChatLine, ClientMsg, PeerInfo, ProjectInfo, ServerMsg, ServicesState } from '../shared/protocol.js';
+import { isAgentId } from '../shared/protocol.js';
+import { agentOptions, createAgents, type Agents } from './agents/index.js';
 import { SPAWN } from '../shared/layout.js';
 import { lookFromSeed, sanitizeLook } from '../shared/avatar.js';
 
@@ -59,7 +61,7 @@ function findPublicDir(): string {
   throw new Error(`Client bundle not found (looked in ${candidates.join(', ')}). Run \`npm run build\`.`);
 }
 
-function projectInfo(cfg: Config): ProjectInfo {
+function projectInfo(cfg: Config, agents: Agents): ProjectInfo {
   const git = (args: string[]) => {
     try {
       return execFileSync('git', args, { cwd: cfg.dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
@@ -72,7 +74,9 @@ function projectInfo(cfg: Config): ProjectInfo {
     dir: cfg.dir,
     branch: git(['rev-parse', '--abbrev-ref', 'HEAD']),
     remote: git(['remote', 'get-url', 'origin']),
-    agentCmd: [cfg.agentCmd, ...cfg.agentArgs].join(' '),
+    agentCmd: [cfg.agents[cfg.defaultAgent]?.cmd ?? '', ...(cfg.agents[cfg.defaultAgent]?.args ?? [])].join(' '),
+    agents: agentOptions(agents),
+    defaultAgent: cfg.defaultAgent,
   };
 }
 
@@ -121,7 +125,9 @@ export async function startServer(cfg: Config) {
   const auth = new Auth(cfg.verifier, cfg.salt, cfg.secret);
   const clients = new Map<string, Client>();
   const chat: ChatLine[] = [];
-  const project = projectInfo(cfg);
+  // The coding agents workers can run, with their hook settings written out.
+  const agents = createAgents(cfg.agents, cfg.dataDir);
+  const project = projectInfo(cfg, agents);
 
   const sendTo = (c: Client, msg: ServerMsg) => {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
@@ -135,7 +141,7 @@ export async function startServer(cfg: Config) {
     }
   };
 
-  // --- Loopback-only endpoint that Claude Code hooks POST to --------------------------------
+  // --- Loopback-only endpoint that the agents' hooks POST to (/hooks/<agent>) -----------------
   let workers!: WorkerManager;
   let queue!: TaskQueue;
   let changes!: Changes;
@@ -146,7 +152,8 @@ export async function startServer(cfg: Config) {
     } catch {
       return send(res, 400, {});
     }
-    if (req.method !== 'POST' || url.pathname !== '/hooks/claude') return send(res, 404, { ok: false });
+    const agent = /^\/hooks\/([a-z]+)$/.exec(url.pathname)?.[1];
+    if (req.method !== 'POST' || !agent || !isAgentId(agent)) return send(res, 404, { ok: false });
     let payload: unknown = {};
     try {
       const body = await readBody(req);
@@ -155,7 +162,7 @@ export async function startServer(cfg: Config) {
       // permissive: a bad payload still counts as the event
     }
     const token = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
-    const ok = workers.handleHook(url.searchParams.get('worker') ?? '', token, url.searchParams.get('event') ?? '', payload);
+    const ok = workers.handleHook(agent, url.searchParams.get('worker') ?? '', token, url.searchParams.get('event') ?? '', payload);
     send(res, ok ? 200 : 401, {});
   });
   await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
@@ -172,8 +179,8 @@ export async function startServer(cfg: Config) {
   workers = new WorkerManager(
     cfg.dir,
     cfg.dataDir,
-    cfg.agentCmd,
-    cfg.agentArgs,
+    agents,
+    cfg.defaultAgent,
     { url: `http://127.0.0.1:${hookPort}`, token: '' },
     {
       update: (worker) => {
@@ -558,7 +565,8 @@ export async function startServer(cfg: Config) {
       }
       case 'worker.spawn': {
         const kind = msg.kind === 'shell' ? 'shell' : 'agent';
-        const r = workers.spawn(str(msg.deskId, 32), who, str(msg.prompt, 20000) || undefined, msg.worktree === true, kind);
+        const agent = isAgentId(msg.agent) ? msg.agent : undefined;
+        const r = workers.spawn(str(msg.deskId, 32), who, str(msg.prompt, 20000) || undefined, msg.worktree === true, kind, agent);
         if (typeof r === 'string') sendTo(c, { t: 'toast', text: r, level: 'warn' });
         else broadcast({ t: 'toast', text: kind === 'shell' ? `${who} opened a shell at a desk` : `${who} hired ${r.name}${r.prompt ? ' with a task' : ''}`, level: 'info' });
         break;
@@ -643,7 +651,7 @@ export async function startServer(cfg: Config) {
       }
       case 'queue.add': {
         const issue = Number.isInteger(msg.issue) && (msg.issue as number) > 0 ? (msg.issue as number) : undefined;
-        const err = queue.add(str(msg.prompt, 20000), who, str(msg.title, 200), issue);
+        const err = queue.add(str(msg.prompt, 20000), who, str(msg.title, 200), issue, isAgentId(msg.agent) ? msg.agent : undefined);
         if (err) sendTo(c, { t: 'toast', text: err, level: 'warn' });
         else broadcast({ t: 'toast', text: `📋 ${who} queued ${issue !== undefined ? `issue #${issue}` : 'a task'}`, level: 'info' });
         break;
@@ -798,5 +806,5 @@ export async function startServer(cfg: Config) {
     hookServer.close();
   };
 
-  return { server, shutdown, workers, publicDir, hookPort };
+  return { server, shutdown, workers, agents, publicDir, hookPort };
 }

@@ -15,6 +15,10 @@ import type { Usage, UsageState } from '../shared/protocol.js';
  *
  * The transcript format is Claude Code's own and may change: everything below is defensive, and a
  * line it does not understand is skipped, never fatal.
+ *
+ * Cursor's CLI logs no usage in its transcripts, but its `stop` hook reports each turn's tokens
+ * (cursorTurnUsage). Cursor doesn't say what they cost, so they are priced from CURSOR_PRICES and
+ * marked `estimated`, which the office shows as "~$".
  */
 
 export const zeroUsage = (): Usage => ({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, calls: 0 });
@@ -27,6 +31,7 @@ export function addUsage(a: Usage, b: Usage, sign = 1): Usage {
     cacheRead: a.cacheRead + sign * b.cacheRead,
     cost: a.cost + sign * b.cost,
     calls: a.calls + sign * b.calls,
+    ...(a.estimated || b.estimated ? { estimated: true } : {}),
   };
 }
 
@@ -56,6 +61,41 @@ const WEB_SEARCH_USD = 0.01;
 export function priceOf(model: string): [number, number, number] {
   const m = model.toLowerCase();
   return PRICES.find(([re]) => re.test(m))?.[1] ?? OPUS;
+}
+
+/**
+ * USD per million tokens — [input, output, cache read] — for the models Cursor offers, by their
+ * providers' list prices. Rough on purpose: Cursor bills through its own plans, so this only gives
+ * a feel for the spend and is always shown as an estimate. Claude models use PRICES; anything
+ * unknown (including "auto") gets the dearest row here.
+ */
+const CURSOR_PRICES: [RegExp, [number, number, number]][] = [
+  [/gemini.*flash/, [0.3, 2.5, 0.03]],
+  [/gemini/, [1.25, 10, 0.125]],
+  [/grok/, [3, 15, 0.75]],
+  [/composer/, [1.25, 10, 0.125]],
+  [/gpt|codex|o\d/, [1.25, 10, 0.125]],
+];
+const CURSOR_UNKNOWN: [number, number, number] = [3, 15, 0.75];
+
+function cursorPriceOf(model: string): [number, number, number] {
+  const m = model.toLowerCase();
+  if (/claude|opus|sonnet|haiku|fable|mythos/.test(m)) return priceOf(m);
+  return CURSOR_PRICES.find(([re]) => re.test(m))?.[1] ?? CURSOR_UNKNOWN;
+}
+
+/** One Cursor turn's tokens from its stop hook, priced as an estimate. Undefined when it reports none. */
+export function cursorTurnUsage(model: string, p: any): Usage | undefined {
+  const total = num(p?.input_tokens);
+  const output = num(p?.output_tokens);
+  const cacheRead = num(p?.cache_read_tokens);
+  const cacheWrite = num(p?.cache_write_tokens);
+  if (!total && !output) return undefined;
+  // Cursor's input count includes the tokens read from the cache.
+  const input = Math.max(0, total - cacheRead);
+  const [pin, pout, pread] = cursorPriceOf(model);
+  const cost = (input * pin + output * pout + cacheWrite * pin * 1.25 + cacheRead * pread) / 1e6;
+  return { input, output, cacheWrite, cacheRead, cost, calls: 1, estimated: true };
 }
 
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
@@ -93,6 +133,8 @@ export interface UsageTracker {
   since: Usage;
   /** Latest transcript timestamp seen. */
   at?: number;
+  /** Hook-reported turns already counted (Cursor), newest last. */
+  turns?: string[];
 }
 
 export const newTracker = (): UsageTracker => ({ files: {}, since: zeroUsage() });
@@ -104,7 +146,9 @@ export function trackerUsage(t: UsageTracker): Usage {
 }
 
 const asUsage = (v: any): Usage | undefined =>
-  v && typeof v === 'object' ? { input: num(v.input), output: num(v.output), cacheWrite: num(v.cacheWrite), cacheRead: num(v.cacheRead), cost: num(v.cost), calls: num(v.calls) } : undefined;
+  v && typeof v === 'object'
+    ? { input: num(v.input), output: num(v.output), cacheWrite: num(v.cacheWrite), cacheRead: num(v.cacheRead), cost: num(v.cost), calls: num(v.calls), ...(v.estimated === true ? { estimated: true } : {}) }
+    : undefined;
 
 /** Rebuilds a tracker saved by a previous run; anything odd falls back to starting over. */
 export function restoreTracker(saved: any): UsageTracker {
@@ -121,7 +165,18 @@ export function restoreTracker(saved: any): UsageTracker {
   if (base) t.base = { ...base, at: num(saved.base.at) };
   t.since = asUsage(saved.since) ?? zeroUsage();
   if (num(saved.at)) t.at = saved.at;
+  if (Array.isArray(saved.turns)) t.turns = saved.turns.filter((k: unknown) => typeof k === 'string').slice(-TURNS_KEPT);
   return t;
+}
+
+const TURNS_KEPT = 50;
+
+/** Books a turn a hook reported (Cursor). False when that turn was already counted. */
+export function addTurn(t: UsageTracker, key: string, u: Usage): boolean {
+  if (key && t.turns?.includes(key)) return false;
+  if (key) t.turns = [...(t.turns ?? []), key].slice(-TURNS_KEPT);
+  t.since = addUsage(t.since, u);
+  return true;
 }
 
 /** Subagent transcripts live in <transcript dir>/<session id>/subagents/. */
@@ -313,7 +368,7 @@ export class Ledger {
     this.emit();
     if (this.opts.budget !== undefined && this.overBudget && this.warnedDay !== day) {
       this.warnedDay = day;
-      const spent = fmtUsd(this.days[day].cost);
+      const spent = `${this.days[day].estimated ? '~' : ''}${fmtUsd(this.days[day].cost)}${this.days[day].estimated ? ', includes Cursor estimates' : ''}`;
       this.toast(`💸 Today's spend passed the ${fmtUsd(this.opts.budget)} budget (${spent})${this.opts.pauseHiring ? ' — no new hires until tomorrow' : ''}`, 'warn');
     }
   }

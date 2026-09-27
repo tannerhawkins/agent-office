@@ -1,18 +1,20 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, accessSync, constants } from 'node:fs';
-import { execFile, execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
 import path from 'node:path';
 import * as pty from '@lydell/node-pty';
 import headless from '@xterm/headless';
 import serialize from '@xterm/addon-serialize';
-import type { Run, WorkerInfo, WorkerKind, WorkerStatus, WorkerTask } from '../shared/protocol.js';
-import { FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, RGB_FLAG } from '../shared/protocol.js';
+import type { AgentId, Run, WorkerInfo, WorkerKind, WorkerStatus, WorkerTask } from '../shared/protocol.js';
+import { FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, RGB_FLAG, isAgentId } from '../shared/protocol.js';
 import { Worktrees, describeWork, type WorktreeCleanup, type WorktreeState } from './worktrees.js';
 import { DESK_BY_ID } from '../shared/layout.js';
 import { gh } from './github.js';
 import type { ServiceOwner } from './services.js';
-import { TaskNamer, fallbackTask } from './tasks.js';
-import { addUsage, newTracker, restoreTracker, scanTracker, trackerUsage, zeroUsage, type Ledger, type UsageTracker } from './usage.js';
+import { TaskNamer, claudeNamer, cursorNamer, fallbackTask } from './tasks.js';
+import { addTurn, addUsage, newTracker, restoreTracker, scanTracker, trackerUsage, zeroUsage, type Ledger, type UsageTracker } from './usage.js';
+import type { AgentAdapter, AgentEvent, Agents } from './agents/index.js';
+import { safeEq, shq, truncate } from './agents/util.js';
 
 type HeadlessTerminal = InstanceType<typeof headless.Terminal>;
 
@@ -64,8 +66,14 @@ interface Worker {
   leftNeedsInputAt: number;
   keyframeAt: number;
   hookToken: string;
-  /** Claude never reported SessionStart: it's stuck on a trust/login/onboarding screen. */
+  /** The agent never became ready: it's stuck on a trust/login/onboarding screen. */
   bootBlocked?: boolean;
+  /** An approval prompt spotted on its screen (agents with no permission hook) put it in needs_input. */
+  approvalOpen?: boolean;
+  /** Its latest tool, for saying what an approval prompt is about. */
+  lastTool?: string;
+  /** Making its session before launch (Cursor's create-chat). */
+  preparing?: boolean;
   /** Its latest prompts and tool calls, for naming its task. */
   prompts: string[];
   tools: string[];
@@ -89,9 +97,7 @@ export interface WorkerEvents {
 export class WorkerManager {
   private workers = new Map<string, Worker>();
   private statePath: string;
-  private settingsPath: string;
   private trees: Worktrees;
-  private agentPath: string | null = null;
   private screenTimer: NodeJS.Timeout;
   /** The office is shutting down: workers exiting now are being stopped, not failing to resume. */
   private closing = false;
@@ -101,19 +107,17 @@ export class WorkerManager {
   constructor(
     private dir: string,
     private dataDir: string,
-    private agentCmd: string,
-    private agentArgs: string[],
+    private agents: Agents,
+    private defaultAgent: AgentId,
     private hook: HookEnv,
     private events: WorkerEvents,
     private ledger: Ledger,
   ) {
     this.trees = new Worktrees(dir);
     this.statePath = path.join(dataDir, 'workers.json');
-    this.settingsPath = path.join(dataDir, 'claude-hooks.json');
-    this.writeHookSettings();
-    this.agentPath = resolveCommand(agentCmd);
-    const claude = /(^|\/)claude$/.test(agentCmd) ? this.agentPath : resolveCommand('claude');
-    this.namer = new TaskNamer(claude, childEnv(), (id, task, ctx) => {
+    const claude = agents.get('claude')?.path;
+    const cursor = agents.get('cursor')?.path;
+    this.namer = new TaskNamer(claude ? claudeNamer(claude) : cursor ? cursorNamer(cursor) : null, childEnv(), (id, task, ctx) => {
       const w = this.workers.get(id);
       if (!w || w.taskEpoch !== ctx.epoch) return;
       w.info.task = task;
@@ -130,10 +134,6 @@ export class WorkerManager {
     // Whoever was at a desk when the office stopped (a restart, a crash, a dev-server reload) gets
     // straight back to work.
     this.wakeAll();
-  }
-
-  get resolvedAgent(): string | null {
-    return this.agentPath;
   }
 
   list(): WorkerInfo[] {
@@ -159,10 +159,13 @@ export class WorkerManager {
     return false;
   }
 
-  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent'): WorkerInfo | string {
+  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', agent?: AgentId): WorkerInfo | string {
     if (!DESK_BY_ID.has(deskId)) return 'Unknown desk';
     if (this.deskOccupied(deskId)) return 'That desk is taken';
-    if (kind === 'agent') {
+    const agentId = kind === 'agent' ? (agent ?? this.defaultAgent) : undefined;
+    if (agentId) {
+      const unusable = this.unusable(agentId);
+      if (unusable) return unusable;
       const paused = this.ledger.hiringPaused;
       if (paused) return paused;
     }
@@ -178,6 +181,7 @@ export class WorkerManager {
     const info: WorkerInfo = {
       id,
       kind,
+      agent: agentId,
       deskId,
       name: kind === 'shell' ? `${name} 🐚` : name,
       color: kind === 'shell' ? '#8d99ae' : COLORS[Math.floor(Math.random() * COLORS.length)],
@@ -203,7 +207,11 @@ export class WorkerManager {
   resume(id: string): string | undefined {
     const w = this.workers.get(id);
     if (!w) return 'No such worker';
-    if (w.pty) return 'Worker is already running';
+    if (w.pty || w.preparing) return 'Worker is already running';
+    if (w.info.kind === 'agent') {
+      const unusable = this.unusable(w.info.agent ?? 'claude');
+      if (unusable) return unusable;
+    }
     w.info.status = 'starting';
     w.info.exitCode = undefined;
     this.launch(w, undefined, w.info.sessionId);
@@ -212,7 +220,26 @@ export class WorkerManager {
 
   /** Starts every worker that isn't running: nobody should be found asleep at their desk. */
   wakeAll() {
-    for (const w of this.workers.values()) if (!w.pty) this.resume(w.info.id);
+    for (const w of this.workers.values()) {
+      if (w.pty) continue;
+      const err = this.resume(w.info.id);
+      if (err && w.info.kind === 'agent') {
+        w.info.activity = err;
+        this.emitUpdate(w);
+      }
+    }
+  }
+
+  /** Why an agent can't be seated here, when it can't. */
+  private unusable(id: AgentId): string | undefined {
+    const a = this.agents.get(id);
+    if (!a) return `This office isn't set up to run ${id} workers`;
+    if (!a.path) return `${a.label} (${a.cmd}) isn't installed on the office machine`;
+    return undefined;
+  }
+
+  private adapterOf(w: Worker): AgentAdapter | undefined {
+    return w.info.kind === 'agent' ? this.agents.get(w.info.agent ?? 'claude') : undefined;
   }
 
   /**
@@ -389,68 +416,79 @@ export class WorkerManager {
     this.emitUpdate(w);
   }
 
-  /** Claude Code hook callback. */
-  handleHook(workerId: string, token: string, event: string, payload: any): boolean {
+  /** An agent hook's callback (see agents/hook.ts), from the agent the worker runs. */
+  handleHook(agent: string, workerId: string, token: string, event: string, payload: any): boolean {
     const w = this.workers.get(workerId);
     if (!w || !safeEq(token, w.hookToken)) return false;
+    const adapter = this.adapterOf(w);
+    if (!adapter || adapter.id !== agent) return false;
+    const r = adapter.parseHook(event, payload);
+    if (r.sessionId && r.sessionId !== w.info.sessionId) {
+      w.info.sessionId = r.sessionId;
+      this.persist();
+    }
+    if (r.transcript && r.transcript !== w.tracker.transcript) {
+      w.tracker.transcript = r.transcript;
+      this.persist();
+    }
+    if (r.usage && addTurn(w.tracker, r.usage.key, r.usage.usage)) this.bookUsage(w);
+    if (adapter.transcriptUsage) this.scheduleScan(w);
+    for (const e of r.events) this.applyEvent(w, e);
+    return true;
+  }
+
+  /** Moves a worker's status along on what its agent reported. The same rules for every agent. */
+  private applyEvent(w: Worker, e: AgentEvent) {
     const now = Date.now();
-    if (payload?.session_id && typeof payload.session_id === 'string' && payload.session_id !== w.info.sessionId) {
-      w.info.sessionId = payload.session_id;
-      this.persist();
-    }
-    if (typeof payload?.transcript_path === 'string' && payload.transcript_path !== w.tracker.transcript) {
-      w.tracker.transcript = payload.transcript_path;
-      this.persist();
-    }
-    this.scheduleScan(w);
-    switch (event) {
-      case 'SessionStart':
-        if (payload?.source === 'clear') this.clearTask(w);
+    switch (e.type) {
+      case 'sessionStart':
+        if (e.clear) this.clearTask(w);
         if (w.info.status === 'starting' || (w.bootBlocked && w.info.status === 'needs_input')) {
           w.bootBlocked = false;
           this.setStatus(w, 'idle');
         }
         break;
-      case 'UserPromptSubmit':
+      case 'promptSubmit':
         w.bootBlocked = false;
-        if (typeof payload?.prompt === 'string') {
-          w.info.activity = truncate(payload.prompt, 80);
-          this.notePrompt(w, payload.prompt);
+        if (e.prompt) {
+          w.info.activity = truncate(e.prompt, 80);
+          this.notePrompt(w, e.prompt);
         }
         if (w.info.status !== 'working') this.setStatus(w, 'working');
         else this.emitUpdate(w);
         break;
-      case 'PreToolUse':
-        if (payload?.tool_name === 'AskUserQuestion') this.setStatus(w, 'needs_input');
-        else {
-          w.info.activity = describeTool(payload);
-          this.noteTool(w, w.info.activity);
-          if (w.info.status !== 'working') this.setStatus(w, 'working');
-          else this.emitUpdate(w);
-        }
+      case 'askUser':
+        this.setStatus(w, 'needs_input');
         break;
-      case 'PostToolUse':
+      case 'toolStart':
+        w.info.activity = e.label;
+        w.lastTool = e.label;
+        this.noteTool(w, e.label);
+        if (w.info.status !== 'working') this.setStatus(w, 'working');
+        else this.emitUpdate(w);
+        break;
+      case 'toolEnd':
         if (w.info.status === 'needs_input') {
           w.leftNeedsInputAt = now;
+          w.approvalOpen = false;
           this.setStatus(w, 'working');
         }
         break;
-      case 'PermissionRequest':
-        w.info.activity = `Wants permission: ${describeTool(payload)}`;
+      case 'permissionRequest':
+        w.info.activity = `Wants permission: ${e.label}`;
         this.setStatus(w, 'needs_input');
         break;
-      case 'Notification':
-        if (payload?.notification_type === 'permission_prompt') {
-          if (now - w.leftNeedsInputAt > LATE_PROMPT_GRACE_MS) this.setStatus(w, 'needs_input');
-        } else if (payload?.notification_type === 'idle_prompt') {
-          if (w.info.status === 'working') this.setStatus(w, 'done');
-        }
+      case 'permissionNotice':
+        if (now - w.leftNeedsInputAt > LATE_PROMPT_GRACE_MS) this.setStatus(w, 'needs_input');
         break;
-      case 'Stop':
+      case 'idle':
+        if (w.info.status === 'working') this.setStatus(w, 'done');
+        break;
+      case 'stop':
+        w.approvalOpen = false;
         this.setStatus(w, 'done');
         break;
     }
-    return true;
   }
 
   /** A new message for the worker: show it right away, and have its task (re)named. */
@@ -509,20 +547,46 @@ export class WorkerManager {
   // ---------------------------------------------------------------------------
 
   private launch(w: Worker, prompt: string | undefined, resumeSessionId: string | undefined) {
+    const adapter = this.adapterOf(w);
+    // Cursor can make its conversation up front: then its id is known (and resumable) from the start.
+    if (adapter?.newSession && !resumeSessionId) {
+      w.preparing = true;
+      this.emitUpdate(w);
+      void adapter.newSession(this.cwdOf(w), childEnv()).then((id) => {
+        w.preparing = false;
+        if (this.workers.get(w.info.id) !== w || w.pty || this.closing) return;
+        if (id) {
+          w.info.sessionId = id;
+          this.persist();
+        }
+        this.start(w, adapter, prompt, id);
+      });
+      return;
+    }
+    this.start(w, adapter, prompt, resumeSessionId);
+  }
+
+  private cwdOf(w: Worker): string {
+    return w.info.worktree ? path.join(this.dir, w.info.worktree.path) : this.dir;
+  }
+
+  private start(w: Worker, adapter: AgentAdapter | undefined, prompt: string | undefined, resumeSessionId: string | undefined) {
     const { info } = w;
     const term = new headless.Terminal({ cols: info.cols, rows: info.rows, scrollback: SCROLLBACK, allowProposedApi: true });
     const ser = new serialize.SerializeAddon();
     term.loadAddon(ser as any);
     // OSC 9;4 progress (Claude Code emits it): 0 = idle, anything else = busy. Catches Esc-cancel,
     // which fires no Stop hook.
-    term.parser.registerOscHandler(9, (data: string) => {
-      const m = /^4;(\d)/.exec(data);
-      if (m) this.onProgress(w, m[1] !== '0');
-      return true;
-    });
+    if (adapter?.trustsProgress) {
+      term.parser.registerOscHandler(9, (data: string) => {
+        const m = /^4;(\d)/.exec(data);
+        if (m) this.onProgress(w, m[1] !== '0');
+        return true;
+      });
+    }
     term.onTitleChange((title: string) => {
       const clean = title.replace(/^[^\p{L}\p{N}]+/u, '').trim();
-      if (clean && clean !== info.title && !/^claude( code)?$/i.test(clean)) {
+      if (clean && clean !== info.title && !adapter?.titleIgnore?.test(clean)) {
         info.title = clean;
         this.emitUpdate(w);
       }
@@ -532,17 +596,10 @@ export class WorkerManager {
     w.ser = ser;
     w.lastLines = [];
     w.screenDirty = true;
+    w.approvalOpen = false;
 
     const shell = process.env.SHELL || '/bin/bash';
-    const isShell = info.kind === 'shell';
-    const isClaude = !isShell && /(^|\/)claude$/.test(this.agentCmd);
-    const args = isShell ? ['-l'] : [...this.agentArgs];
-    if (isClaude) {
-      args.unshift('--settings', this.settingsPath);
-      if (resumeSessionId) args.push('--resume', resumeSessionId);
-      // `--` so a prompt like "- fix login" is never parsed as a CLI option.
-      if (prompt) args.push('--', prompt);
-    }
+    const args = adapter ? adapter.args({ prompt, resumeId: resumeSessionId }) : ['-l'];
     const env = childEnv();
     Object.assign(env, {
       TERM: 'xterm-256color',
@@ -552,30 +609,24 @@ export class WorkerManager {
       AGENT_OFFICE_HOOK_TOKEN: w.hookToken,
     });
 
-    const cwd = info.worktree ? path.join(this.dir, info.worktree.path) : this.dir;
+    const cwd = this.cwdOf(w);
+    const what = adapter ? adapter.cmd : shell;
     let proc: pty.IPty;
     try {
       if (!existsSync(cwd)) throw new Error(`working directory is gone: ${cwd}`);
-      if (isShell) {
-        proc = pty.spawn(shell, args, { name: 'xterm-256color', cols: info.cols, rows: info.rows, cwd, env });
-      } else if (this.agentPath) {
-        proc = pty.spawn(this.agentPath, args, { name: 'xterm-256color', cols: info.cols, rows: info.rows, cwd, env });
-      } else {
-        // Not found on PATH: let a login shell find it (nvm, asdf, ~/.local/bin ...).
-        const line = ['exec', this.agentCmd, ...args].map((a, i) => (i < 2 ? a : shq(a))).join(' ');
-        proc = pty.spawn(shell, ['-l', '-i', '-c', line], { name: 'xterm-256color', cols: info.cols, rows: info.rows, cwd, env });
-      }
+      if (adapter && !adapter.path) throw new Error(`${adapter.cmd} isn't installed on this machine`);
+      proc = pty.spawn(adapter ? adapter.path! : shell, args, { name: 'xterm-256color', cols: info.cols, rows: info.rows, cwd, env });
     } catch (err) {
       info.status = 'exited';
       info.exitCode = -1;
-      const what = isShell ? shell : this.agentCmd;
       term.write(`\r\n\x1b[31mFailed to start ${what}: ${(err as Error).message}\x1b[0m\r\n`);
       this.events.toast(`Could not start ${what}: ${(err as Error).message}`, 'error');
       this.emitUpdate(w);
       return;
     }
     w.pty = proc;
-    if (!isClaude) info.status = 'idle';
+    // A shell, or an agent the office gets no hooks from, is ready as soon as it's running.
+    if (!adapter?.hooks) info.status = 'idle';
 
     proc.onData((data) => {
       term.write(data);
@@ -587,7 +638,7 @@ export class WorkerManager {
       w.pty = undefined;
       // Resuming a conversation Claude no longer has ("No conversation found") exits before Claude
       // ever starts. Start a fresh one rather than leave the worker asleep.
-      if (isClaude && resumeSessionId && info.status === 'starting' && !this.closing) {
+      if (adapter?.resumeExitsEarly && resumeSessionId && info.status === 'starting' && !this.closing) {
         this.events.toast(`${info.name}'s last conversation couldn't be resumed — starting a fresh one`, 'warn');
         this.launch(w, undefined, undefined);
         return;
@@ -602,11 +653,12 @@ export class WorkerManager {
       this.emitUpdate(w);
       this.persist();
     });
-    // SessionStart fires as soon as Claude can take input. Still silent after a while means it is
-    // blocked on a human: folder trust dialog, login, first-run onboarding. Flag it so it jumps.
+    // The agent says when it can take input: a hook (Claude's SessionStart) or its prompt bar on
+    // screen (Cursor). Still not ready after a while means it is blocked on a human: folder trust
+    // dialog, login, first-run onboarding. Flag it so it jumps.
     setTimeout(() => {
       if (info.status !== 'starting' || w.pty !== proc) return;
-      if (isClaude) {
+      if (adapter?.bootViaHook || adapter?.screen.ready) {
         w.bootBlocked = true;
         info.activity = 'Waiting on a setup prompt (trust / login) — open the terminal';
         this.setStatus(w, 'needs_input');
@@ -632,6 +684,11 @@ export class WorkerManager {
     } catch {
       return; // an unreadable transcript is retried on the next scan
     }
+    this.bookUsage(w);
+  }
+
+  /** The worker's tracker moved on: show its new totals and book the difference on the ledger. */
+  private bookUsage(w: Worker) {
     const before = w.info.usage ?? zeroUsage();
     const after = trackerUsage(w.tracker);
     w.info.usage = after;
@@ -700,77 +757,53 @@ export class WorkerManager {
   }
 
   /**
-   * Claude can sit at its prompt without being usable: stuck on a first-run screen, or not signed
-   * in on this machine. Flag that as needing a human, and clear it once the screen moves on.
+   * An agent can sit at its prompt without being usable: stuck on a first-run screen, or not signed
+   * in on this machine. Flag that as needing a human, and clear it once the screen moves on. For an
+   * agent whose hooks don't say when it's ready, its prompt bar coming up is what says so.
    */
   private checkBlocked(w: Worker) {
-    if (w.info.kind !== 'agent' || !w.term) return;
+    const rules = this.adapterOf(w)?.screen;
+    if (!rules || !w.term) return;
+    this.checkApproval(w, rules.approval);
     const s = w.info.status;
     if (s !== 'starting' && s !== 'idle' && !(w.bootBlocked && s === 'needs_input')) return;
     const text = screenText(w.term);
-    const loggedOut = NOT_LOGGED_IN.test(text);
-    const blocked = loggedOut || (SETUP_PROMPT.test(text) && (s === 'starting' || w.bootBlocked));
+    const loggedOut = !!rules.loggedOut?.test(text);
+    const blocked = loggedOut || (!!rules.setup?.test(text) && (s === 'starting' || w.bootBlocked));
     if (blocked && s !== 'needs_input') {
       w.bootBlocked = true;
-      w.info.activity = loggedOut
-        ? "Claude isn't signed in on this machine — open the terminal and type /login"
-        : 'Waiting on a setup prompt (trust / login) — open the terminal';
+      w.info.activity = loggedOut ? rules.loginHint : 'Waiting on a setup prompt (trust / login) — open the terminal';
       this.setStatus(w, 'needs_input');
     } else if (!blocked && w.bootBlocked && s === 'needs_input') {
       w.bootBlocked = false;
       w.info.activity = undefined;
       this.setStatus(w, 'idle');
+    } else if (!blocked && s === 'starting' && rules.ready?.test(text)) {
+      this.setStatus(w, 'idle');
     }
   }
 
-  private writeHookSettings() {
-    const events: [string, string | undefined][] = [
-      ['SessionStart', undefined],
-      ['UserPromptSubmit', undefined],
-      ['Stop', undefined],
-      ['Notification', undefined],
-      ['PermissionRequest', undefined],
-      ['PreToolUse', undefined],
-      ['PostToolUse', undefined],
-    ];
-    // Minimal VPS images sometimes lack curl; the office's own node binary is always there.
-    const nodeHook = path.join(this.dataDir, 'hook.cjs');
-    writeFileSync(
-      nodeHook,
-      `const http = require('http');
-const [event] = process.argv.slice(2);
-let body = '';
-process.stdin.on('data', (c) => (body += c));
-process.stdin.on('end', () => {
-  const url = new URL(process.env.AGENT_OFFICE_HOOK_URL + '/hooks/claude');
-  url.searchParams.set('worker', process.env.AGENT_OFFICE_WORKER_ID);
-  url.searchParams.set('event', event);
-  const req = http.request(url, { method: 'POST', timeout: 3000, headers: { authorization: 'Bearer ' + process.env.AGENT_OFFICE_HOOK_TOKEN, 'content-type': 'application/json' } }, (res) => res.resume());
-  req.on('error', () => {});
-  req.on('timeout', () => req.destroy());
-  req.end(body);
-});
-`,
-      { mode: 0o600 },
-    );
-    const hooks: Record<string, unknown[]> = {};
-    for (const [event, matcher] of events) {
-      const curl =
-        `curl -sS -m 3 -X POST -H "Authorization: Bearer $AGENT_OFFICE_HOOK_TOKEN" -H "Content-Type: application/json" ` +
-        `--data-binary @- "$AGENT_OFFICE_HOOK_URL/hooks/claude?worker=$AGENT_OFFICE_WORKER_ID&event=${event}"`;
-      const command =
-        `if [ -z "$AGENT_OFFICE_WORKER_ID" ] || [ -z "$AGENT_OFFICE_HOOK_URL" ]; then exit 0; fi; ` +
-        `if command -v curl >/dev/null 2>&1; then ${curl} >/dev/null 2>&1; ` +
-        `else ${shq(process.execPath)} ${shq(nodeHook)} ${event} >/dev/null 2>&1; fi; true`;
-      hooks[event] = [{ ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command }] }];
+  /** An approval prompt on screen, for agents that have no hook for it (Cursor): needs a human. */
+  private checkApproval(w: Worker, approval: RegExp | undefined) {
+    if (!approval || !w.term) return;
+    const s = w.info.status;
+    if (!w.approvalOpen && s !== 'working') return;
+    const open = approval.test(screenText(w.term));
+    if (open && !w.approvalOpen) {
+      w.approvalOpen = true;
+      w.info.activity = `Wants permission: ${w.lastTool ?? 'a tool'}`;
+      this.setStatus(w, 'needs_input');
+    } else if (!open && w.approvalOpen) {
+      w.approvalOpen = false;
+      if (s === 'needs_input') this.setStatus(w, 'working');
     }
-    writeFileSync(this.settingsPath, JSON.stringify({ hooks }, null, 2), { mode: 0o600 });
   }
 
   private persist() {
     const saved = [...this.workers.values()].map(({ info, tracker }) => ({
       id: info.id,
       kind: info.kind,
+      agent: info.agent,
       deskId: info.deskId,
       name: info.name,
       color: info.color,
@@ -799,9 +832,11 @@ process.stdin.on('end', () => {
       for (const s of saved) {
         if (!s.id || !s.deskId || !DESK_BY_ID.has(s.deskId) || this.deskOccupied(s.deskId)) continue;
         const tracker = restoreTracker(s.tracker);
+        const kind: WorkerKind = s.kind === 'shell' ? 'shell' : 'agent';
         const info: WorkerInfo = {
           id: s.id,
-          kind: s.kind === 'shell' ? 'shell' : 'agent',
+          kind,
+          agent: kind === 'agent' ? (isAgentId(s.agent) ? s.agent : 'claude') : undefined,
           deskId: s.deskId,
           name: s.name ?? 'Worker',
           color: s.color ?? COLORS[0],
@@ -816,7 +851,7 @@ process.stdin.on('end', () => {
           activity: s.activity,
           task: validTask(s.task),
           pr: s.pr && typeof s.pr.number === 'number' && typeof s.pr.url === 'string' ? { number: s.pr.number, url: s.pr.url } : undefined,
-          usage: tracker.transcript ? trackerUsage(tracker) : undefined,
+          usage: tracker.transcript || tracker.turns?.length ? trackerUsage(tracker) : undefined,
           cols: 100,
           rows: 30,
           viewers: [],
@@ -915,54 +950,11 @@ function snapshotScreen(term: HeadlessTerminal, last: string[]) {
   return { cols, rows, lines, full, cursor: [buf.cursorX, buf.cursorY] as [number, number] };
 }
 
-/** First-run screens Claude shows before it can take a prompt. */
-const SETUP_PROMPT = /trust this folder|Do you trust the files|Select login method|Choose the text style|Press Enter to continue|Bypass Permissions mode/i;
-const NOT_LOGGED_IN = /Not logged in\s*·\s*Run \/login|Invalid API key|Please run \/login/i;
-
 function screenText(term: HeadlessTerminal): string {
   const buf = term.buffer.active;
   const out: string[] = [];
   for (let y = 0; y < term.rows; y++) out.push(buf.getLine(buf.viewportY + y)?.translateToString(true) ?? '');
   return out.join('\n');
-}
-
-function resolveCommand(cmd: string): string | null {
-  if (cmd.includes('/')) {
-    try {
-      accessSync(cmd, constants.X_OK);
-      return path.resolve(cmd);
-    } catch {
-      return null;
-    }
-  }
-  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
-    if (!dir) continue;
-    const p = path.join(dir, cmd);
-    try {
-      accessSync(p, constants.X_OK);
-      return p;
-    } catch {
-      // keep looking
-    }
-  }
-  try {
-    const shell = process.env.SHELL || '/bin/bash';
-    const found = execFileSync(shell, ['-l', '-i', '-c', `command -v ${shq(cmd)}`], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
-      .trim()
-      .split('\n')
-      .pop();
-    if (found && found.startsWith('/')) return found;
-  } catch {
-    // fall through
-  }
-  return null;
-}
-
-function describeTool(payload: any): string {
-  const name = payload?.tool_name ?? 'tool';
-  const input = payload?.tool_input ?? {};
-  const detail = input.command ?? input.file_path ?? input.pattern ?? input.url ?? input.description ?? '';
-  return truncate(detail ? `${name}: ${detail}` : String(name), 80);
 }
 
 function offlineBanner(info: WorkerInfo): string {
@@ -1006,22 +998,6 @@ function draftPr(info: WorkerInfo, commits: string[], by: string): { title: stri
   return { title, body: parts.join('\n\n') };
 }
 
-function truncate(s: string, n: number) {
-  const one = s.replace(/\s+/g, ' ').trim();
-  return one.length > n ? `${one.slice(0, n - 1)}…` : one;
-}
-
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
-}
-
-function shq(s: string) {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-function safeEq(a: string, b: string) {
-  if (a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
 }

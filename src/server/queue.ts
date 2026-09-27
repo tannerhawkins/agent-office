@@ -1,14 +1,15 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { GhPull, QueueState, QueueTask, WorkerInfo, WorkerStatus } from '../shared/protocol.js';
+import type { AgentId, GhPull, QueueState, QueueTask, WorkerInfo, WorkerKind, WorkerStatus } from '../shared/protocol.js';
+import { isAgentId } from '../shared/protocol.js';
 import { DESKS, DESK_BY_ID } from '../shared/layout.js';
 
 /** What the queue needs from the worker manager. Narrow on purpose, so a smoke test can fake it. */
 export interface QueueWorkers {
   list(): WorkerInfo[];
   deskOccupied(deskId: string): boolean;
-  spawn(deskId: string, by: string, prompt: string, worktree: boolean): WorkerInfo | string;
+  spawn(deskId: string, by: string, prompt: string, worktree: boolean, kind?: WorkerKind, agent?: AgentId): WorkerInfo | string;
   /** Resolves with a line about what became of the worker's worktree. */
   kill(id: string): Promise<{ note?: string; error?: string }>;
 }
@@ -71,7 +72,7 @@ export class TaskQueue {
     return this.maxWorkers;
   }
 
-  add(prompt: string, by: string, title?: string, issue?: number): string | undefined {
+  add(prompt: string, by: string, title?: string, issue?: number, agent?: AgentId): string | undefined {
     const clean = prompt.replace(/\r\n?/g, '\n').trim();
     if (!clean) return 'Empty task';
     if (issue !== undefined && this.tasks.some((t) => t.issue === issue && t.status !== 'done')) return `Issue #${issue} is already on the queue`;
@@ -84,6 +85,7 @@ export class TaskQueue {
       addedBy: by,
       addedAt: Date.now(),
       status: 'queued',
+      agent,
     };
     this.tasks.push(task);
     this.changed();
@@ -264,7 +266,7 @@ export class TaskQueue {
       if (this.events.hiringPaused()) break;
       const desk = this.freeDesk() ?? this.recycleDesk();
       if (!desk) break;
-      const r = this.workers.spawn(desk, `${t.addedBy} (queue)`, t.prompt + (this.useWorktree ? WORKTREE_NOTE : ''), this.useWorktree);
+      const r = this.workers.spawn(desk, `${t.addedBy} (queue)`, t.prompt + (this.useWorktree ? WORKTREE_NOTE : ''), this.useWorktree, 'agent', t.agent);
       changed = true;
       if (typeof r === 'string') {
         t.status = 'done';
@@ -320,6 +322,7 @@ export class TaskQueue {
           addedBy: s.addedBy ?? '?',
           addedAt: s.addedAt ?? Date.now(),
           status: s.status === 'running' || s.status === 'done' ? s.status : 'queued',
+          agent: isAgentId(s.agent) ? s.agent : undefined,
           workerId: s.workerId,
           workerName: s.workerName,
           branch: s.branch,

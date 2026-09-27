@@ -2,6 +2,7 @@ import { randomBytes, scryptSync } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { isAgentId, type AgentId } from '../shared/protocol.js';
 
 export interface Config {
   dir: string;
@@ -20,8 +21,10 @@ export interface Config {
   claimed: boolean;
   /** Forget the plaintext password for good once it has been shown. */
   markClaimed(): void;
-  agentCmd: string;
-  agentArgs: string[];
+  /** The agents workers can run. Claude Code and Cursor always; `custom` only for an unknown --agent. */
+  agents: Partial<Record<AgentId, AgentConfig>>;
+  /** What a new worker runs when nobody picks. */
+  defaultAgent: AgentId;
   tls?: { cert: string; key: string };
   trustProxy: boolean;
   iceServers: RTCIceServerLike[];
@@ -33,13 +36,18 @@ export interface Config {
   budgetPause: boolean;
 }
 
+export interface AgentConfig {
+  cmd: string;
+  args: string[];
+}
+
 export interface RTCIceServerLike {
   urls: string | string[];
   username?: string;
   credential?: string;
 }
 
-const HELP = `agent-office — a 3D office for your team and its Claude Code workers
+const HELP = `agent-office — a 3D office for your team and its Claude Code and Cursor workers
 
 Usage:
   agent-office [dir] [options]
@@ -64,8 +72,17 @@ Options:
                           is kept and the password is never displayed again.
       --reset-password    Forget the generated password (a new one is made on the
                           next start) and exit
-      --agent <cmd>       Command a worker runs (default "claude", env AGENT_OFFICE_AGENT)
-      --agent-args <str>  Extra args for every worker, e.g. "--model opus"
+      --default-agent <a> What a new worker runs unless someone picks: claude or
+                          cursor (default claude, env AGENT_OFFICE_DEFAULT_AGENT)
+      --claude-cmd <cmd>  Claude Code command (default "claude", env AGENT_OFFICE_CLAUDE_CMD)
+      --claude-args <s>   Extra args for Claude workers, e.g. "--model opus"
+                          (env AGENT_OFFICE_CLAUDE_ARGS)
+      --cursor-cmd <cmd>  Cursor CLI command (default "cursor-agent", env AGENT_OFFICE_CURSOR_CMD)
+      --cursor-args <s>   Extra args for Cursor workers, e.g. "--model gpt-5.5"
+                          (env AGENT_OFFICE_CURSOR_ARGS)
+      --agent <cmd>       Older form: claude, cursor, or a command. Any other command
+                          runs as a plain terminal (env AGENT_OFFICE_AGENT)
+      --agent-args <str>  Extra args for the --agent one (env AGENT_OFFICE_AGENT_ARGS)
       --tls-cert <file>   Serve HTTPS with this certificate (PEM)
       --tls-key <file>    ...and this private key (PEM)
       --self-signed       Serve HTTPS with a generated self-signed certificate
@@ -90,6 +107,16 @@ function takeValue(args: string[], i: number, flag: string): string {
     process.exit(2);
   }
   return v;
+}
+
+/** Like takeValue, but the value may itself start with dashes ("--model opus"). */
+function takeArgs(args: string[], i: number, flag: string): string[] {
+  const v = args[i + 1];
+  if (v === undefined) {
+    console.error(`agent-office: ${flag} needs a value`);
+    process.exit(2);
+  }
+  return splitArgs(v);
 }
 
 function splitArgs(s: string): string[] {
@@ -127,8 +154,14 @@ export function loadConfig(argv: string[]): Config {
   let port = Number(process.env.PORT) || 4600;
   let host = '0.0.0.0';
   let password = process.env.AGENT_OFFICE_PASSWORD || '';
-  let agentCmd = process.env.AGENT_OFFICE_AGENT || 'claude';
-  let agentArgs: string[] = splitArgs(process.env.AGENT_OFFICE_AGENT_ARGS || '');
+  const env = process.env;
+  let legacyCmd = env.AGENT_OFFICE_AGENT || '';
+  let legacyArgs: string[] | undefined = env.AGENT_OFFICE_AGENT_ARGS ? splitArgs(env.AGENT_OFFICE_AGENT_ARGS) : undefined;
+  let defaultAgent = env.AGENT_OFFICE_DEFAULT_AGENT || '';
+  let claudeCmd = env.AGENT_OFFICE_CLAUDE_CMD || '';
+  let claudeArgs: string[] | undefined = env.AGENT_OFFICE_CLAUDE_ARGS ? splitArgs(env.AGENT_OFFICE_CLAUDE_ARGS) : undefined;
+  let cursorCmd = env.AGENT_OFFICE_CURSOR_CMD || '';
+  let cursorArgs: string[] | undefined = env.AGENT_OFFICE_CURSOR_ARGS ? splitArgs(env.AGENT_OFFICE_CURSOR_ARGS) : undefined;
   let tlsCert = '';
   let tlsKey = '';
   let selfSigned = false;
@@ -158,10 +191,25 @@ export function loadConfig(argv: string[]): Config {
         password = takeValue(argv, i++, a);
         break;
       case '--agent':
-        agentCmd = takeValue(argv, i++, a);
+        legacyCmd = takeValue(argv, i++, a);
         break;
       case '--agent-args':
-        agentArgs = splitArgs(takeValue(argv, i++, a));
+        legacyArgs = takeArgs(argv, i++, a);
+        break;
+      case '--default-agent':
+        defaultAgent = takeValue(argv, i++, a);
+        break;
+      case '--claude-cmd':
+        claudeCmd = takeValue(argv, i++, a);
+        break;
+      case '--claude-args':
+        claudeArgs = takeArgs(argv, i++, a);
+        break;
+      case '--cursor-cmd':
+        cursorCmd = takeValue(argv, i++, a);
+        break;
+      case '--cursor-args':
+        cursorArgs = takeArgs(argv, i++, a);
         break;
       case '--tls-cert':
         tlsCert = takeValue(argv, i++, a);
@@ -208,6 +256,12 @@ export function loadConfig(argv: string[]): Config {
     console.error('agent-office: invalid --port');
     process.exit(2);
   }
+  if (defaultAgent && (!isAgentId(defaultAgent) || defaultAgent === 'custom')) {
+    console.error('agent-office: --default-agent is claude or cursor');
+    process.exit(2);
+  }
+  const { agents, defaultAgent: chosen } = resolveAgents({ legacyCmd, legacyArgs, defaultAgent: defaultAgent as AgentId | '', claudeCmd, claudeArgs, cursorCmd, cursorArgs });
+
   const budgetUsd = budget ? Number(budget.replace(/^\$/, '')) : undefined;
   if (budgetUsd !== undefined && !(budgetUsd > 0)) {
     console.error('agent-office: --budget needs an amount in dollars, e.g. --budget 20');
@@ -290,8 +344,8 @@ export function loadConfig(argv: string[]): Config {
       this.claimed = true;
       this.password = undefined;
     },
-    agentCmd,
-    agentArgs,
+    agents,
+    defaultAgent: chosen,
     tls,
     trustProxy,
     iceServers,
@@ -315,4 +369,42 @@ export async function ensureSelfSigned(cfg: Config): Promise<void> {
   writeFileSync(certPath, pems.cert, { mode: 0o600 });
   writeFileSync(keyPath, pems.private, { mode: 0o600 });
   cfg.tls = { cert: pems.cert, key: pems.private };
+}
+
+/**
+ * The agents and which one is the default. The per-agent flags win; the older --agent names one of
+ * them (claude, cursor, or a path to either) or, for anything else, a custom command that runs as a
+ * plain terminal the way every non-Claude agent used to.
+ */
+export function resolveAgents(o: {
+  legacyCmd: string;
+  legacyArgs?: string[];
+  defaultAgent: AgentId | '';
+  claudeCmd: string;
+  claudeArgs?: string[];
+  cursorCmd: string;
+  cursorArgs?: string[];
+}): { agents: Partial<Record<AgentId, AgentConfig>>; defaultAgent: AgentId } {
+  const agents: Partial<Record<AgentId, AgentConfig>> = { claude: { cmd: 'claude', args: [] }, cursor: { cmd: 'cursor-agent', args: [] } };
+  let target: AgentId = 'claude';
+  if (o.legacyCmd) {
+    const base = path.basename(o.legacyCmd);
+    if (o.legacyCmd === 'claude' || o.legacyCmd === 'cursor') target = o.legacyCmd;
+    else if (base === 'claude') {
+      target = 'claude';
+      agents.claude!.cmd = o.legacyCmd;
+    } else if (base === 'cursor-agent' || base === 'agent') {
+      target = 'cursor';
+      agents.cursor!.cmd = o.legacyCmd;
+    } else {
+      target = 'custom';
+      agents.custom = { cmd: o.legacyCmd, args: [] };
+    }
+  }
+  if (o.legacyArgs) agents[target]!.args = o.legacyArgs;
+  if (o.claudeCmd) agents.claude!.cmd = o.claudeCmd;
+  if (o.claudeArgs) agents.claude!.args = o.claudeArgs;
+  if (o.cursorCmd) agents.cursor!.cmd = o.cursorCmd;
+  if (o.cursorArgs) agents.cursor!.args = o.cursorArgs;
+  return { agents, defaultAgent: o.defaultAgent || (o.legacyCmd ? target : 'claude') };
 }

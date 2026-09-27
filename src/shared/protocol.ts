@@ -14,6 +14,24 @@ export type WorkerStatus =
 
 export type WorkerKind = 'agent' | 'shell';
 
+/** Which coding agent a worker runs: Claude Code, Cursor's CLI, or whatever `--agent` named. */
+export type AgentId = 'claude' | 'cursor' | 'custom';
+export const AGENT_IDS: readonly AgentId[] = ['claude', 'cursor', 'custom'];
+export const isAgentId = (v: unknown): v is AgentId => typeof v === 'string' && (AGENT_IDS as readonly string[]).includes(v);
+
+/** An agent the office can seat, as the hire dialogs offer it. */
+export interface AgentOption {
+  id: AgentId;
+  label: string;
+  /** Short mark for badges ("C", "Cu"). */
+  badge: string;
+  badgeColor: string;
+  /** Its command line, as the office runs it. */
+  cmd: string;
+  /** Found on the office machine. */
+  available: boolean;
+}
+
 /** What a worker is on, for the card above its head: "Fix Login Redirect" + what it's doing now. */
 export interface WorkerTask {
   name: string;
@@ -22,8 +40,10 @@ export interface WorkerTask {
 
 export interface WorkerInfo {
   id: string;
-  /** 'agent' runs Claude Code (or --agent); 'shell' is a plain shared login shell. */
+  /** 'agent' runs a coding agent (see `agent`); 'shell' is a plain shared login shell. */
   kind: WorkerKind;
+  /** Which agent it runs (agents only; missing on old saves means Claude Code). */
+  agent?: AgentId;
   deskId: string;
   name: string;
   color: string;
@@ -53,11 +73,11 @@ export interface WorkerInfo {
   activity?: string;
   /** Written by a small model from its prompts and recent tool calls (see server/tasks.ts). */
   task?: WorkerTask;
-  /** Tokens and cost of its Claude session so far, subagents included (agents only). */
+  /** Tokens and cost of its agent session so far, subagents included (agents only). */
   usage?: Usage;
 }
 
-/** Tokens and what they cost, summed over a Claude Code session or the whole office. */
+/** Tokens and what they cost, summed over an agent session or the whole office. */
 export interface Usage {
   /** Input tokens that missed the prompt cache. */
   input: number;
@@ -70,6 +90,8 @@ export interface Usage {
   cost: number;
   /** API calls (assistant messages) counted. */
   calls: number;
+  /** Some of the cost is a guess: Cursor reports tokens but not what they cost. */
+  estimated?: boolean;
 }
 
 /** Spend across the whole office, kept on disk (see server/usage.ts). */
@@ -174,6 +196,8 @@ export interface QueueTask {
   addedBy: string;
   addedAt: number;
   status: TaskStatus;
+  /** The agent to seat for it; missing means the office default at the time. */
+  agent?: AgentId;
   /** The worker seated for it (it may have gone home since). */
   workerId?: string;
   workerName?: string;
@@ -275,7 +299,10 @@ export interface ProjectInfo {
   dir: string;
   branch?: string;
   remote?: string;
+  /** The default agent's command line. */
   agentCmd: string;
+  agents: AgentOption[];
+  defaultAgent: AgentId;
 }
 
 export interface TeamMember {
@@ -406,7 +433,7 @@ export type ClientMsg =
   /** You reached out to use something; everyone else sees your character's arm do it. */
   | { t: 'act' }
   | { t: 'profile'; name: string; color: string; look: Look }
-  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind }
+  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind; agent?: AgentId }
   | { t: 'worker.resume'; workerId: string }
   | { t: 'worker.kill'; workerId: string; cleanup?: WorktreeCleanup }
   /** Asks what the worker's worktree holds; answered with a `worker.worktree` message. */
@@ -421,7 +448,7 @@ export type ClientMsg =
   | { t: 'gh.refresh' }
   /** Merge a pull request; the answer comes back as gh.merged. */
   | { t: 'gh.merge'; number: number; method: GhMergeMethod; deleteBranch: boolean; auto?: boolean }
-  | { t: 'queue.add'; prompt: string; title?: string; issue?: number }
+  | { t: 'queue.add'; prompt: string; title?: string; issue?: number; agent?: AgentId }
   | { t: 'queue.remove'; taskId: string }
   /** Move a queued task up (-1) or down (+1) the queue. */
   | { t: 'queue.move'; taskId: string; delta: number }

@@ -1,6 +1,7 @@
 // Names what each worker is on: a few words and a one-line summary for the card above its head.
-// A small model (Claude Haiku, through the `claude` CLI the office already needs) writes them from
-// the worker's prompts and recent tool calls. Without it, the card falls back to the prompt itself.
+// A small model writes them from the worker's prompts and recent tool calls: Claude Haiku through
+// the `claude` CLI when it's installed, else Cursor's CLI in read-only ask mode. Without either, the
+// card falls back to the prompt itself.
 
 import { spawn } from 'node:child_process';
 import os from 'node:os';
@@ -39,6 +40,48 @@ const SCHEMA = JSON.stringify({
   additionalProperties: false,
 });
 
+/** A CLI that can answer one prompt headlessly and print JSON. */
+export interface NamerBackend {
+  cmd: string;
+  args(input: string): string[];
+  /** Whether the input goes on stdin (else it's in the args). */
+  stdin: boolean;
+  env?: Record<string, string>;
+}
+
+export function claudeNamer(cmd: string): NamerBackend {
+  return {
+    cmd,
+    stdin: true,
+    env: { MAX_THINKING_TOKENS: '0' },
+    args: () => [
+      '-p',
+      '--model', 'haiku',
+      '--output-format', 'json',
+      '--json-schema', SCHEMA,
+      '--system-prompt', SYSTEM,
+      '--tools', '',
+      // Not the user's or the project's settings: no hooks, no MCP servers, no plugins, no transcript.
+      '--setting-sources', '',
+      '--strict-mcp-config',
+      '--disable-slash-commands',
+      '--no-session-persistence',
+    ],
+  };
+}
+
+/** Slower and pricier than Haiku (see docs/cursor-agent-notes.md), so only used without `claude`. */
+export function cursorNamer(cmd: string): NamerBackend {
+  return {
+    cmd,
+    stdin: false,
+    args: (input) => [
+      '-p', '--trust', '--mode', 'ask', '--output-format', 'json', '--model', 'auto',
+      '--', `${SYSTEM}\nReply with only the JSON object {"name": ..., "summary": ...}, no code fence.\n\n${input}`,
+    ],
+  };
+}
+
 export class TaskNamer {
   private pending = new Map<string, TaskContext>();
   private timers = new Map<string, NodeJS.Timeout>();
@@ -48,17 +91,17 @@ export class TaskNamer {
   private pausedUntil = 0;
 
   /**
-   * @param claude the `claude` binary, or null to only ever use the prompt as the label
+   * @param backend the CLI that writes labels, or null to only ever use the prompt as the label
    * @param env environment for it (the office's own, minus anything that marks a child session)
    */
   constructor(
-    private claude: string | null,
+    private backend: NamerBackend | null,
     private env: Record<string, string>,
     private done: (workerId: string, task: WorkerTask, ctx: TaskContext) => void,
   ) {}
 
   get enabled(): boolean {
-    return this.claude !== null && Date.now() >= this.pausedUntil;
+    return this.backend !== null && Date.now() >= this.pausedUntil;
   }
 
   /** Asks for a fresh label. Calls for the same worker close together collapse into one. */
@@ -103,7 +146,7 @@ export class TaskNamer {
 
   private async generate(ctx: TaskContext): Promise<WorkerTask | null> {
     if (!this.enabled) return null;
-    const out = await run(this.claude!, this.env, describe(ctx));
+    const out = await run(this.backend!, this.env, describe(ctx));
     const task = out === null ? null : parse(out);
     if (task) this.fails = 0;
     else if (++this.fails >= FAILS_BEFORE_BACKOFF) {
@@ -130,20 +173,7 @@ function describe(ctx: TaskContext): string {
   return parts.join('\n\n');
 }
 
-function run(claude: string, env: Record<string, string>, input: string): Promise<string | null> {
-  const args = [
-    '-p',
-    '--model', 'haiku',
-    '--output-format', 'json',
-    '--json-schema', SCHEMA,
-    '--system-prompt', SYSTEM,
-    '--tools', '',
-    // Not the user's or the project's settings: no hooks, no MCP servers, no plugins, no transcript.
-    '--setting-sources', '',
-    '--strict-mcp-config',
-    '--disable-slash-commands',
-    '--no-session-persistence',
-  ];
+function run(backend: NamerBackend, env: Record<string, string>, input: string): Promise<string | null> {
   return new Promise((resolve) => {
     let out = '';
     let settled = false;
@@ -153,10 +183,10 @@ function run(claude: string, env: Record<string, string>, input: string): Promis
       clearTimeout(timer);
       resolve(v);
     };
-    const child = spawn(claude, args, {
-      // A neutral directory, so it doesn't pick up the project's CLAUDE.md.
+    const child = spawn(backend.cmd, backend.args(input), {
+      // A neutral directory, so it doesn't pick up the project's CLAUDE.md or rules.
       cwd: os.tmpdir(),
-      env: { ...env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, ...backend.env },
       stdio: ['pipe', 'pipe', 'ignore'],
     });
     const timer = setTimeout(() => {
@@ -168,7 +198,7 @@ function run(claude: string, env: Record<string, string>, input: string): Promis
     child.on('error', () => finish(null));
     child.on('close', (code) => finish(code === 0 ? out : null));
     child.stdin.on('error', () => {});
-    child.stdin.end(input);
+    child.stdin.end(backend.stdin ? input : undefined);
   });
 }
 
