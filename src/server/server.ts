@@ -19,6 +19,7 @@ import { Services } from './services.js';
 import { ImageProxy } from './decor.js';
 import { Ledger } from './usage.js';
 import { PlanLimitsReader } from './limits.js';
+import { CursorLimitsReader } from './cursor-limits.js';
 import { Webhook } from './webhook.js';
 import { Building, type FloorDef } from './building.js';
 import { Floor, type FloorContext } from './floor.js';
@@ -332,6 +333,13 @@ export async function startServer(cfg: Config) {
     childEnv(),
     () => clients.size > 0,
     (state) => broadcast({ t: 'limits', state }),
+  );
+
+  // Cursor's own plan usage, read from the desktop app's stored session (see cursor-limits.ts).
+  const cursorLimits = new CursorLimitsReader(
+    resolveCommand('sqlite3'),
+    () => clients.size > 0,
+    (state) => broadcast({ t: 'cursorLimits', state }),
   );
 
   // Slack / Discord pings for workers that need input or finish (set from ⚙️ Settings or --webhook).
@@ -786,6 +794,7 @@ export async function startServer(cfg: Config) {
       upgrade: upgrader.state,
       usage: ledger.state(),
       limits: limits.state,
+      cursorLimits: cursorLimits.state,
       me,
       notify: webhook.state(),
       sky: sky.state,
@@ -1226,6 +1235,9 @@ export async function startServer(cfg: Config) {
       case 'limits.refresh':
         limits.refresh();
         break;
+      case 'cursorLimits.refresh':
+        cursorLimits.refresh();
+        break;
       case 'team.get':
         void team.state().then((state) => sendTo(c, { t: 'team', state }));
         break;
@@ -1438,6 +1450,7 @@ export async function startServer(cfg: Config) {
     for (const f of floors.values()) f.shutdown(keep);
     ledger.flush();
     limits.close();
+    cursorLimits.close();
     for (const c of clients.values()) c.ws.close();
     server.close();
     hookServer.close();

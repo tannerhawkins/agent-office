@@ -6,7 +6,7 @@ import { newer, type WbElement } from '../shared/whiteboard';
 import type { DogState } from '../shared/dog';
 import { JUKEBOX_TUNES, type JukeboxState } from '../shared/jukebox';
 
-export type Topic = 'peers' | 'workers' | 'issues' | 'pulls' | 'chat' | 'project' | 'screens' | 'team' | 'upgrade' | 'services' | 'decor' | 'usage' | 'limits' | 'queue' | 'me' | 'accounts' | 'notify' | 'floors' | 'floor' | 'repos' | 'dog' | 'jukebox' | 'sky' | 'whiteboard' | 'drawing';
+export type Topic = 'peers' | 'workers' | 'issues' | 'pulls' | 'chat' | 'project' | 'screens' | 'team' | 'upgrade' | 'services' | 'decor' | 'usage' | 'limits' | 'cursorLimits' | 'queue' | 'me' | 'accounts' | 'notify' | 'floors' | 'floor' | 'repos' | 'dog' | 'jukebox' | 'sky' | 'whiteboard' | 'drawing';
 
 const zeroUsage = (): Usage => ({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, calls: 0 });
 
@@ -140,6 +140,8 @@ class Store {
   usage: UsageState = { total: zeroUsage(), today: zeroUsage(), day: '', pauseHiring: false };
   /** The Claude plan's 5-hour and weekly limits. */
   limits: PlanLimits = { windows: [], at: 0 };
+  /** Cursor's own plan usage for the current billing cycle. */
+  cursorLimits: PlanLimits = { windows: [], at: 0 };
   queue: QueueState = { tasks: [], maxWorkers: 0 };
   /** Who you're signed in as (see /api/whoami). */
   me: Me = { admin: false };
@@ -239,12 +241,13 @@ class Store {
         this.upgrade = msg.upgrade;
         this.usage = msg.usage;
         this.limits = msg.limits;
+        this.cursorLimits = msg.cursorLimits;
         this.me = msg.me;
         this.notify = msg.notify;
         this.clock = undefined; // compared again, in case it's another office (or the same one, restarted)
         this.sky = msg.sky;
         this.enter(msg);
-        for (const t of ['peers', 'chat', 'upgrade', 'usage', 'limits', 'me', 'notify', 'floors', 'sky'] as Topic[]) this.emit(t);
+        for (const t of ['peers', 'chat', 'upgrade', 'usage', 'limits', 'cursorLimits', 'me', 'notify', 'floors', 'sky'] as Topic[]) this.emit(t);
         break;
       case 'floor.enter':
         this.peers = new Map(msg.peers.map((p) => [p.id, p]));
@@ -354,6 +357,10 @@ class Store {
       case 'limits':
         this.limits = msg.state;
         this.emit('limits');
+        break;
+      case 'cursorLimits':
+        this.cursorLimits = msg.state;
+        this.emit('cursorLimits');
         break;
       case 'queue':
         this.queue = msg.state;

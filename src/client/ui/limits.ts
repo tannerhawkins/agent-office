@@ -1,4 +1,4 @@
-import type { PlanWindow } from '../../shared/protocol';
+import type { PlanLimits, PlanWindow } from '../../shared/protocol';
 import { store } from '../state';
 import { $, h } from './dom';
 
@@ -33,14 +33,22 @@ function windowRow(w: PlanWindow, now: number): HTMLElement[] {
   ];
 }
 
-/** The Claude plan's 5-hour session and weekly limits, under the workers. Click to read them again. */
-export function renderLimits() {
-  const s = store.limits;
-  const el = $('limits');
+function renderPlanLimits(elId: string, title: string, s: PlanLimits) {
+  const el = $(elId);
   el.classList.toggle('hidden', !s.windows.length);
   if (!s.windows.length) return;
   const now = Date.now();
   const plan = s.plan ? s.plan.charAt(0).toUpperCase() + s.plan.slice(1) : '';
-  el.replaceChildren(h('h3', {}, 'Claude limits', plan ? h('span.plan', {}, plan) : null), ...s.windows.flatMap((w) => windowRow(w, now)));
+  el.replaceChildren(h('h3', {}, title, plan ? h('span.plan', {}, plan) : null), ...s.windows.flatMap((w) => windowRow(w, now)));
   if (now - s.at > STALE_MS) el.append(h('div.row.muted', {}, `As of ${new Date(s.at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`));
+}
+
+/** The Claude plan's 5-hour session and weekly limits, under the workers. Click to read them again. */
+export function renderLimits() {
+  renderPlanLimits('limits', 'Claude limits', store.limits);
+}
+
+/** Cursor's own plan usage for the current billing cycle. Click to read it again. */
+export function renderCursorLimits() {
+  renderPlanLimits('cursor-limits', 'Cursor limits', store.cursorLimits);
 }

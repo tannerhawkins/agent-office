@@ -110,9 +110,9 @@ export interface UsageState {
   pauseHiring: boolean;
 }
 
-/** One of the Claude plan's usage windows: the 5-hour session, the week, or a model's week. */
+/** One of a plan's usage windows: e.g. the 5-hour session, the week, a model's week, or a billing cycle. */
 export interface PlanWindow {
-  /** e.g. "5h session", "Week", "Fable week". */
+  /** e.g. "5h session", "Week", "Fable week", "Individual". */
   label: string;
   /** Percent of the window used, 0-100. */
   pct: number;
@@ -121,13 +121,14 @@ export interface PlanWindow {
 }
 
 /**
- * The Claude plan limits of the account the office's Claude workers run on, as Claude Code's
- * /usage shows them (see server/limits.ts). One account for the whole building.
+ * The plan limits of the account the office's workers run on: Claude Code's /usage numbers (see
+ * server/limits.ts), or Cursor's billing-cycle usage (see server/cursor-limits.ts). One account for
+ * the whole building, for each.
  */
 export interface PlanLimits {
   /** 'pro', 'max', 'team', 'enterprise'…, when known. */
   plan?: string;
-  /** The 5-hour session first, then the week, then per-model weeks. Empty until first read, or when there is no plan. */
+  /** The 5-hour session first, then the week, then per-model weeks (Claude); or Individual/Team on-demand (Cursor). Empty until first read, or when there is no plan. */
   windows: PlanWindow[];
   /** When the numbers were read (ms since epoch); 0 before the first read. */
   at: number;
@@ -700,6 +701,8 @@ export type ClientMsg =
   | { t: 'upgrade.start' }
   /** Read the Claude plan limits again now, instead of at the next poll. */
   | { t: 'limits.refresh' }
+  /** Read Cursor's plan usage again now, instead of at the next poll. */
+  | { t: 'cursorLimits.refresh' }
   /** Hang a picture on a wall. */
   | { t: 'decor.add'; decor: DecorPlacement }
   /** Move, resize, re-frame or swap the image of a picture. */
@@ -747,6 +750,7 @@ export type ServerMsg =
       upgrade: UpgradeState;
       usage: UsageState;
       limits: PlanLimits;
+      cursorLimits: PlanLimits;
       me: Me;
       notify: NotifyState;
       /** Outside the windows: the same on every floor. */
@@ -801,6 +805,7 @@ export type ServerMsg =
   | ({ t: 'wb.pointer'; id: string; selected?: string[] } & WbPointer)
   | { t: 'usage'; state: UsageState }
   | { t: 'limits'; state: PlanLimits }
+  | { t: 'cursorLimits'; state: PlanLimits }
   | { t: 'queue'; state: QueueState }
   | { t: 'notify'; state: NotifyState }
   | { t: 'sky'; state: SkyState }

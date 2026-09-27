@@ -46,7 +46,7 @@ import { hiringPaused, renderUsage, usageLabel, usageTitle } from './ui/usage';
 import { elevatorPanelOpen, openElevator, routeElevatorMessage } from './ui/elevator';
 import { providerLabel, resolvedProvider } from './ui/provider';
 import { mirrorWhiteboard, openWhiteboard, routeWhiteboardMessage } from './ui/whiteboard';
-import { renderLimits } from './ui/limits';
+import { renderCursorLimits, renderLimits } from './ui/limits';
 import { openJukebox } from './ui/jukebox';
 import { Arcade } from './ui/arcade';
 import { trackTitle } from '../shared/jukebox';
@@ -652,9 +652,12 @@ store.on('workers', syncWorkers);
 store.on('workers', renderUsage);
 store.on('usage', renderUsage);
 store.on('limits', renderLimits);
+store.on('cursorLimits', renderCursorLimits);
 // The reset countdowns tick down between reads.
 setInterval(renderLimits, 30_000);
+setInterval(renderCursorLimits, 30_000);
 $('limits').addEventListener('click', () => net.send({ t: 'limits.refresh' }));
+$('cursor-limits').addEventListener('click', () => net.send({ t: 'cursorLimits.refresh' }));
 
 // ---- Actions ------------------------------------------------------------------------------------
 function freeDesk(): string | null {
