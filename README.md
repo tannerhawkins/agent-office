@@ -1,6 +1,6 @@
 # 🏢 Agent Office
 
-A cartoon 3D office your team walks around in together. Sit a Claude Code worker at any empty desk, watch its terminal on the laptop in front of it, and jump into that terminal with everyone else. Issues and pull requests hang on cork boards on the wall. You can talk over voice and put your screen on the lounge TV.
+A cartoon 3D office your team walks around in together. Sit a Claude Code or Cursor worker at any empty desk, watch its terminal on the laptop in front of it, and jump into that terminal with everyone else. Issues and pull requests hang on cork boards on the wall. You can talk over voice and put your screen on the lounge TV.
 
 Everything is scoped to **one directory on the machine that runs it**: every worker, terminal and board works in that project.
 
@@ -14,16 +14,17 @@ agent-office
 - **Walk around.** Use WASD, Space to jump, and drag the mouse to orbit the camera. Everyone in the office sees everyone else move in real time.
 - **Boss office.** Stairs along the back wall climb to a glass-walled office on the loft in the corner. From up there you can look down over every desk and watch your workers go.
 - **Pick your character.** The first time you join, a character select screen lets you choose your skin tone, hair style, hair color and shirt, with a spinning preview. Change it any time from **⚙️** or by clicking your name under *In the office*.
-- **Hire workers.** Walk up to an empty desk and press **E** to seat a fresh Claude Code session, or press **P** to write a task first. A little worker sits down, a laptop opens, and Claude's live screen appears on it.
+- **Hire workers.** Walk up to an empty desk and press **E** to seat a fresh Claude Code or Cursor session, or press **P** to write a task first. A little worker sits down, a laptop opens, and the agent's live screen appears on it.
+- **Claude Code and Cursor side by side.** Every hire dialog has a *Claude Code / Cursor* switch; your last pick is remembered and is what **E** hires. Cursor workers get the same status, task cards, resume, queue and PR flow as Claude ones, and wear their agent on their name tag and a chest pin. See [Claude Code and Cursor](#claude-code-and-cursor).
 - **Shared shells.** Press **B** at an empty desk to open a plain login shell for dev servers, git or tests. It's shared the same way as a Claude terminal.
 - **Isolated branches.** When you hire with a task, you can tick *own git worktree*. The worker then gets its own `office/<name>` branch under `.agent-office/worktrees/`, so parallel workers never share a checkout. When you send that worker home you choose whether to keep the worktree and branch, delete the worktree, or delete both, and the office warns you first about uncommitted changes or commits no remote has. `agent-office prune` clears out whatever was kept, once it is safe.
 - **One-click PRs.** When a worktree worker is done, press **O** at its desk. The office pushes the branch and opens a pull request with a title and body drafted from the task (work handed over from the issues board gets a `Closes #n`). The PR shows up on the PR board right away, tagged with the worker's desk, and **Go to desk** takes you there. Press **O** again to see the PR.
 - **Shared terminals.** Press **E** at an occupied desk to open the real terminal (a PTY, over WebSockets). Several people can type into the same session at once, and anyone who joins late gets the full scrollback.
 - **Changes at the desk.** Press **C** at an occupied desk (or click **🌿 Changes** in its terminal) to see what the worker changed: the changed files and their diff against the branch the office was opened on, refreshed every couple of seconds while it works. From there you can commit, discard, or push the branch and open a pull request.
-- **Live status.** Claude Code hooks drive each worker's status: *working*, *needs input* or *done*. When a worker needs a human or has finished, it jumps up and down and you hear a ding. Its antenna bulb shows the status from across the room.
-- **Task cards.** A card over each worker's head names what it's on ("Fix Login Redirect") and says in one line what it's doing right now. Claude Haiku writes it from the worker's prompts and latest tool calls through the `claude` CLI, a fraction of a cent each time. Without that, the card shows the prompt itself.
-- **Survives restarts.** Workers are saved to disk. After a server restart they come back asleep, and **R** resumes the exact Claude session.
-- **Cost per worker.** Every worker shows what its Claude session has cost and how many tokens it used, on the desk hint, in the sidebar and in its terminal header. The sidebar adds up today's and all-time spend for the whole office. All of it survives restarts. Start the office with `--budget 20` and everyone gets a warning when the day's spend passes $20; add `--budget-pause` and no new workers can be hired until the next day.
+- **Live status.** The agent's hooks drive each worker's status: *working*, *needs input* or *done*. When a worker needs a human or has finished, it jumps up and down and you hear a ding. Its antenna bulb shows the status from across the room.
+- **Task cards.** A card over each worker's head names what it's on ("Fix Login Redirect") and says in one line what it's doing right now. Claude Haiku writes it from the worker's prompts and latest tool calls through the `claude` CLI, a fraction of a cent each time (or Cursor's CLI when `claude` isn't installed). Without either, the card shows the prompt itself.
+- **Survives restarts.** Workers are saved to disk. After a server restart they come back asleep, and **R** resumes the exact Claude or Cursor session.
+- **Cost per worker.** Every worker shows what its session has cost and how many tokens it used, on the desk hint, in the sidebar and in its terminal header. The sidebar adds up today's and all-time spend for the whole office. All of it survives restarts. Start the office with `--budget 20` and everyone gets a warning when the day's spend passes $20; add `--budget-pause` and no new workers can be hired until the next day.
 - **Issues board.** A tack board shows GitHub issues in *Open*, *In progress* and *Closed*. Click an issue to read it and its comments, then choose **Hand to a worker** to seat a worker with a ready-made prompt, or **Add to queue**.
 - **PR board.** A second tack board shows pull requests in *Draft*, *In review*, *Approved*, *Merged* and *Closed*, with CI status and diff size. Click a PR to read its description, comments, reviews and checks. **Files changed** shows the diff, with the files listed on the left as a folder tree or a flat list, and review comments under the lines they're on. Tick a file **Reviewed** (or press **V**; **J**/**K** step through files) and it folds away. Your ticks are kept in your browser, and a file you ticked that changes again is flagged. **Merge…** squashes, merges or rebases it, and can have GitHub merge it once its checks pass. **Review** and **Fix comments & merge** hand the PR to a worker; the second one addresses the review comments, gets the checks green and merges. When the PR conflicts with its base, that button becomes **Fix conflicts & merge**: a new worker is picked by default, merges the base in, resolves the conflicts and merges.
 - **Ask a worker about anything on a board.** Every issue and PR has **✍️ Ask a worker…**: type your own prompt, and the worker gets it along with which issue or PR it's about. Send it to a new worker at a free desk, or to one already sitting at a desk.
@@ -40,7 +41,7 @@ agent-office
 On the machine that runs the office (your laptop or a VPS):
 
 - **Node.js 20+**. Prebuilt PTY binaries ship for Linux and macOS, x64 and arm64, so no compiler is needed.
-- **Claude Code** (`claude`), installed and logged in as the user that runs the office.
+- **Claude Code** (`claude`) and/or **Cursor's CLI** (`cursor-agent`), installed and logged in as the user that runs the office. Whichever is missing is greyed out in the hire dialogs.
 - **git**, plus the **GitHub CLI** (`gh`) logged in (`gh auth login`) if you want the issue and PR boards.
 - `curl` is optional. The status hooks use it when it's there and fall back to Node when it isn't.
 
@@ -69,8 +70,13 @@ agent-office [dir] [options]
   -p, --port <n>          Port (default 4600, env PORT)
   -H, --host <addr>       Bind address (default 0.0.0.0)
       --password <pw>     Office password (env AGENT_OFFICE_PASSWORD)
-      --agent <cmd>       Command each worker runs (default "claude")
-      --agent-args <str>  Extra args for every worker, e.g. "--model opus"
+      --default-agent <a> What a new worker runs unless someone picks: claude or cursor
+      --claude-cmd <cmd>  Claude Code command (default "claude")
+      --claude-args <str> Extra args for Claude workers, e.g. "--model opus"
+      --cursor-cmd <cmd>  Cursor CLI command (default "cursor-agent")
+      --cursor-args <str> Extra args for Cursor workers, e.g. "--model gpt-5.5"
+      --agent <cmd>       Older form: claude, cursor, or any other command (runs as a plain terminal)
+      --agent-args <str>  Extra args for the --agent one
       --tls-cert <file>   Serve HTTPS with this cert…
       --tls-key <file>    …and key
       --self-signed       Serve HTTPS with a generated self-signed cert
@@ -85,6 +91,21 @@ agent-office prune [dir] [-n|--dry-run] [-f|--force]
   office/* branches. Anything with uncommitted changes or unpushed commits is
   kept unless --force is given.
 ```
+
+## Claude Code and Cursor
+
+Each worker runs one of the office's agents, chosen when it's hired: **Claude Code** (`claude`) or **Cursor's CLI** (`cursor-agent`). Both can sit in the office at the same time, and they work the same way: the same status bulb and bounce, task cards, shared terminal, **P** to prompt, **R** to resume, own worktree, one-click PR, and the task queue. Install and sign in to whichever you want on the office machine (`cursor-agent login`, or `CURSOR_API_KEY` in the office's environment).
+
+```bash
+agent-office --default-agent cursor --cursor-args "--model gpt-5.5"
+```
+
+What's different for Cursor workers:
+
+- **Cost is an estimate.** Cursor reports each turn's tokens but not what they cost, so the office prices them from list prices for the model. Cursor's share is shown with a `~` (`~$0.42`), counts toward `--budget`, and the budget warning says it includes estimates.
+- **Approvals follow your Cursor settings.** Cursor workers run with `--trust` and otherwise your own Cursor CLI config. If yours is set to *Run Everything*, they never stop to ask; otherwise an approval prompt makes the worker jump with *needs input*, like Claude's.
+- **Interrupt with Ctrl + C.** Cursor stops a running turn on Ctrl + C; Esc does not interrupt a tool that is already running.
+- **Nothing in `~/.cursor` is changed.** The office's hooks are loaded per worker from a small plugin it writes to `.agent-office/cursor-plugin/` (`--plugin-dir`).
 
 ## Controls
 
@@ -104,7 +125,7 @@ agent-office prune [dir] [-n|--dry-run] [-f|--force]
 | T / Enter | Chat |
 | V / M | Join voice / mute |
 | Esc | Close any window (a terminal too) and get back to looking around |
-| Ctrl + [ | Send Esc to a terminal (e.g. to interrupt Claude) |
+| Ctrl + [ | Send Esc to a terminal (e.g. to interrupt Claude; Cursor stops on Ctrl + C) |
 
 You can also click a nearby desk to interact with it, or click a worker in the sidebar to open its terminal.
 
@@ -193,6 +214,8 @@ Useful options for `up`:
 - Pass `--claude-token "$(claude setup-token)"`, which uses your Claude subscription, or `--anthropic-api-key <key>`.
 - Do nothing, and the first worker jumps with *"Claude isn't signed in — type /login"*. Open its terminal and run `/login`.
 
+**Cursor.** Add `--cursor` to also install Cursor's CLI, and `--cursor-api-key <key>` (or `$CURSOR_API_KEY`) to sign it in. Without a key, the first Cursor worker jumps with a login link in its terminal.
+
 **GitHub.** By default, your local `gh auth token` is used to sign in the GitHub CLI on the machine. It's needed for private repos, the issue and PR boards, and for workers to push branches and open PRs. Anyone who can use the office can use that token, so pass `--github-token <fine-grained token>` or `--no-github-token` if that's too much.
 
 ## Running it on a VPS for your team
@@ -256,30 +279,30 @@ If you don't have a domain, `--self-signed` serves HTTPS directly. Browsers will
 
 ```
 browser ──HTTPS/WSS──▶ agent-office (Node)
-                         ├─ node-pty ─▶ claude  (one PTY per worker, cwd = project dir)
+                         ├─ node-pty ─▶ claude | cursor-agent  (one PTY per worker, cwd = project dir)
                          │    └─ headless xterm mirror ─▶ laptop screen frames + late-join snapshots
-                         ├─ loopback-only hook server ◀── curl from Claude Code hooks (per-worker token)
+                         ├─ loopback-only hook server ◀── curl from the agents' hooks (per-worker token)
                          ├─ gh issue/pr list (cached, refreshed every 90s)
                          ├─ port scan every 4s ─▶ 🌐 Services board; relay for service tunnels
                          ├─ /api/image ─▶ fetches pictures for the walls (cached)
                          └─ WebRTC signaling relay (voice + screen share are peer-to-peer)
 ```
 
-- **Status.** Each worker starts as `claude --settings .agent-office/claude-hooks.json`. That file adds hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification`, `Stop`, `SessionStart`) which `curl` a server bound to `127.0.0.1`. The hooks merge with your own Claude settings; they don't replace them. OSC 9;4 progress sequences in the terminal also count, which catches an Esc-cancel.
+- **Status.** Each worker starts as `claude --settings .agent-office/claude-hooks.json`. That file adds hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification`, `Stop`, `SessionStart`) which `curl` a server bound to `127.0.0.1`. The hooks merge with your own Claude settings; they don't replace them. OSC 9;4 progress sequences in the terminal also count, which catches an Esc-cancel. A Cursor worker starts as `cursor-agent --trust --plugin-dir .agent-office/cursor-plugin`: the plugin's hooks (`sessionStart`, `beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `afterFileEdit`, `stop`) post to the same server. Cursor has no hook for "waiting for approval" or "ready", so those two are read off its screen. Each agent is an adapter in `src/server/agents/` that maps its hooks onto one set of events, so both kinds go through the same status rules; `docs/cursor-agent-notes.md` records how Cursor's CLI behaves.
 - **Shared shells.** Press **B** at an empty desk to open a plain login shell for dev servers, git or tests. It's shared the same way as a Claude terminal.
 - **Isolated branches.** When you hire with a task, you can tick *own git worktree*. The worker then gets its own `office/<name>` branch under `.agent-office/worktrees/`, so parallel workers never share a checkout. When you send that worker home you choose whether to keep the worktree and branch, delete the worktree, or delete both, and the office warns you first about uncommitted changes or commits no remote has. `agent-office prune` clears out whatever was kept, once it is safe.
 - **Pull requests.** **O** at a worktree worker's desk runs `git push -u origin office/<name>` in its worktree, then `gh pr create` with the task as the body and the commits listed. The base is the branch the office was on when the worktree was cut, if that branch is on the remote. The PR number is saved with the worker, so the board can point back at the desk.
 - **Changes.** While someone has a desk's Changes window open, the office runs `git status` and `git diff` in that worker's checkout every two seconds and pushes the file list when it differs. The diff is against the merge base with the branch the office was opened on, so it covers the worker's commits and its uncommitted edits. Commit is `git add -A && git commit`, discard is `git restore` / `git clean` (or `reset --hard` for everything), and Open PR pushes the branch and runs `gh pr create`.
 - **Shared terminals.** The server keeps one PTY per worker and mirrors it in a headless xterm. People who open the terminal get a serialized snapshot, then the live stream. Laptops get compact per-row diffs a few times a second. The PTY takes the size of whoever is typing.
-- **Cost.** Hooks carry no usage, but each one names the session's transcript (`~/.claude/projects/<dir>/<session>.jsonl`). The office reads what gets appended to it, and to the subagent transcripts next to it: every assistant message records the API's token usage and the model, which the office prices from its own table (cache writes and reads included). When a session ends, Claude Code appends its own tally (`cost-state`), and the worker's numbers snap to that, which also covers calls that never reach the transcript. Per-worker totals are saved with the worker, and `.agent-office/usage.json` keeps the office's all-time and per-day spend, so nothing is lost on a restart or when a worker is sent home. On an office deployed with `deploy/aws.sh`, put `AGENT_OFFICE_BUDGET=20` (and `AGENT_OFFICE_BUDGET_PAUSE=1`) in `/etc/agent-office/env` and restart the service.
+- **Cost.** Hooks carry no usage, but each one names the session's transcript (`~/.claude/projects/<dir>/<session>.jsonl`). The office reads what gets appended to it, and to the subagent transcripts next to it: every assistant message records the API's token usage and the model, which the office prices from its own table (cache writes and reads included). When a session ends, Claude Code appends its own tally (`cost-state`), and the worker's numbers snap to that, which also covers calls that never reach the transcript. Per-worker totals are saved with the worker, and `.agent-office/usage.json` keeps the office's all-time and per-day spend, so nothing is lost on a restart or when a worker is sent home. A Cursor worker's tokens come from its `stop` hook instead, one turn at a time, and are priced as an estimate. On an office deployed with `deploy/aws.sh`, put `AGENT_OFFICE_BUDGET=20` (and `AGENT_OFFICE_BUDGET_PAUSE=1`) in `/etc/agent-office/env` and restart the service.
 - **Services.** Every 4 seconds the office lists the TCP ports its user's processes listen on (`ss`, or `lsof` on macOS). It credits each port to the worker whose terminal started it. It goes by the process tree first. For a server that detached from it, it uses the `AGENT_OFFICE_WORKER_ID` the process inherited (Linux), then whether it runs inside that worker's worktree. Ports that answer HTTP are shown. A request for `localhost:<port>` that reaches the office's own port (that's what a service tunnel does) is relayed to that server, WebSockets included, so hot reload works.
 - **Pictures.** WebGL can only draw an image from another site if that site sends CORS headers, and most don't. So the office fetches each picture itself (`/api/image`, images up to 15 MB) and serves it from its own origin. Any image link works, and a picture on a worker's dev server does too. Browsers shrink each one to 1024 px before it goes on the wall.
-- **Task queue.** `queue.json` holds the tasks in order. A task is seated when a desk is free and fewer than the limit are busy (a worker that is starting, ready, working or waiting for input). It finishes when its worker ends its turn (the `Stop` hook), stops, or is sent home. The PR is matched by GitHub's closing-issue references (`closes #12`) or by the worker's branch.
+- **Task queue.** `queue.json` holds the tasks in order. A task is seated when a desk is free and fewer than the limit are busy (a worker that is starting, ready, working or waiting for input). It finishes when its worker ends its turn (the `Stop` / `stop` hook), stops, or is sent home. A queued task keeps the agent it was added with. The PR is matched by GitHub's closing-issue references (`closes #12`) or by the worker's branch.
 - **State.** `.agent-office/` in the project holds the password, the signing secret, the hook settings, the saved workers, the task queue and the pictures on the walls (`decor.json`). It is added to `.git/info/exclude` automatically, so it never shows up in `git status`.
 
 ## Security notes
 
-Anyone with the password can drive Claude Code in that directory, and through it run commands as the user that runs the office. Treat the password like SSH access:
+Anyone with the password can drive Claude Code or Cursor in that directory, and through it run commands as the user that runs the office. Treat the password like SSH access:
 
 - Use a strong password and HTTPS. With `--trust-proxy`, cookies are `Secure` once the proxy says the request came over https.
 - Changing the password signs everyone out, because sessions are signed with a key derived from it. Login attempts are limited to 10 per 5 minutes per client.

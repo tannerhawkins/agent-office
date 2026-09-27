@@ -2,6 +2,7 @@
 # Runs ON the EC2 instance (piped over ssh by deploy/aws.sh). Idempotent: safe to re-run.
 # Expects these to be exported by the caller: APP_REPO APP_REF PROJECT_REPO PROJECT_NAME
 # CLAIM_TOKEN PUBLIC_HOST GH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GIT_NAME GIT_EMAIL
+# and optionally INSTALL_CURSOR=1 CURSOR_API_KEY
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 APT=(sudo -E apt-get -y -q -o DPkg::Lock::Timeout=600)
@@ -39,6 +40,14 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 echo "    claude $(claude --version 2>/dev/null | head -1)"
 
+if [[ "${INSTALL_CURSOR:-0}" == 1 || -n "${CURSOR_API_KEY:-}" ]]; then
+  if [[ ! -x "$HOME/.local/bin/cursor-agent" ]]; then
+    step "Installing Cursor's CLI"
+    quiet bash -c 'curl -fsSL https://cursor.com/install | bash'
+  fi
+  echo "    cursor-agent $(cursor-agent --version 2>/dev/null | head -1)"
+fi
+
 step "Writing secrets to /etc/agent-office/env"
 sudo install -d -m 755 /etc/agent-office
 env_file=$(mktemp)
@@ -48,6 +57,7 @@ env_file=$(mktemp)
   [[ -n "${PUBLIC_HOST:-}" ]] && printf 'AGENT_OFFICE_PUBLIC_HOST="%s"\n' "$PUBLIC_HOST"
   [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && printf 'CLAUDE_CODE_OAUTH_TOKEN="%s"\n' "$CLAUDE_CODE_OAUTH_TOKEN"
   [[ -n "${ANTHROPIC_API_KEY:-}" ]] && printf 'ANTHROPIC_API_KEY="%s"\n' "$ANTHROPIC_API_KEY"
+  [[ -n "${CURSOR_API_KEY:-}" ]] && printf 'CURSOR_API_KEY="%s"\n' "$CURSOR_API_KEY"
   true
 } >"$env_file"
 sudo install -m 600 -o root -g root "$env_file" /etc/agent-office/env
