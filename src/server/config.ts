@@ -4,13 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { WEATHERS, type Weather } from '../shared/protocol.js';
+import { MAX_WORKER_LIMIT, parseWorkerLimit } from './machine.js';
 
 export interface Config {
   /** The office's own folder: the building's data lives in its .agent-office. */
   dir: string;
   dataDir: string;
-  /** Where new floors are cloned, as <projectsDir>/<owner>/<repo>. */
+  /** Where new floors are cloned by default, as <projectsDir>/<owner>/<repo>. */
   projectsDir: string;
+  /** --projects / AGENT_OFFICE_PROJECTS: picks the projects folder, as ⚙️ Settings in the office does. */
+  projects?: string;
   /** Started as `agent-office <dir>`: that checkout is a floor of its own (it's also `dir`). */
   project?: string;
   host: string;
@@ -38,6 +41,8 @@ export interface Config {
   budget?: number;
   /** Refuse new hires for the rest of the day once the budget is spent. */
   budgetPause: boolean;
+  /** The most workers the office runs at once, across every floor; ⚙️ Settings can't go past it. */
+  maxWorkers?: number;
   /** Slack / Discord webhook to post to when a worker needs input or finishes ('' turns it off). */
   webhook?: string;
   /** Where the office is: its sun and live weather follow this city's forecast. */
@@ -57,6 +62,7 @@ const HELP = `agent-office — a 3D office for your team and its Claude Code / O
 Usage:
   agent-office [options]
   agent-office [dir] [options]
+  agent-office setup [--projects <dir>] [--project <owner/repo>]...
   agent-office prune [dir] [--dry-run] [--force]
   agent-office accounts [list|invite|revoke|role|password] ...
 
@@ -65,11 +71,18 @@ pick one of the repositories your \`gh\` login can see, and the office clones it
 into the projects folder as a new floor. Workers, terminals, boards and the
 task queue on a floor all belong to that floor's checkout.
 
+The first time it starts in a terminal with no floors, it walks you through
+where projects are cloned, signing the GitHub CLI in, and your first project.
+
 Started from anywhere, the office keeps its data in --home. Given a [dir] (or
 started in a project where an office already ran), it keeps its data in
-<dir>/.agent-office as it always has, and that project is one of the floors.
+<dir>/.agent-office as it always has, and that project starts out as a floor
+(an admin can take it off in the elevator like any other).
 
 Commands:
+  setup                   Pick the folder projects are cloned into and clone
+                          projects as floors: a walkthrough in a terminal, or
+                          just --projects / --project for scripts (see setup --help)
   prune                   Remove leftover worker worktrees (.agent-office/worktrees/)
                           and the branches the office cut. Anything with uncommitted
                           changes or unpushed commits is kept unless --force is given.
@@ -80,7 +93,8 @@ Options:
       --home <dir>        Where the office keeps its data when no [dir] is given
                           (default ~/agent-office, env AGENT_OFFICE_HOME)
       --projects <dir>    Where new floors are cloned, as <dir>/<owner>/<repo>
-                          (default ~/agent-office, env AGENT_OFFICE_PROJECTS)
+                          (default ~/agent-office, env AGENT_OFFICE_PROJECTS).
+                          Also settable from ⚙️ Settings in the office
   -p, --port <n>          Port to listen on (default 4600, env PORT)
   -H, --host <addr>       Address to bind (default 0.0.0.0)
       --password <pw>     Office password (env AGENT_OFFICE_PASSWORD).
@@ -106,6 +120,10 @@ Options:
                           day's spend passes it. OpenCode/Codex/Cursor spend is excluded
       --budget-pause      ...and no new workers can be hired until the next
                           day (env AGENT_OFFICE_BUDGET_PAUSE=1)
+      --max-workers <n>   Run at most this many workers at once, across every
+                          floor (env AGENT_OFFICE_MAX_WORKERS). Hiring past it
+                          is refused. Admins can lower the limit from ⚙️
+                          Settings, but not raise it past this
       --webhook <url>     Post to this Slack or Discord webhook when a worker
                           needs input or finishes (env AGENT_OFFICE_WEBHOOK).
                           Also settable from ⚙️ Settings in the office; "" turns it off
@@ -184,6 +202,7 @@ export function loadConfig(argv: string[]): Config {
   let resetPassword = false;
   let budget = process.env.AGENT_OFFICE_BUDGET || '';
   let budgetPause = !!process.env.AGENT_OFFICE_BUDGET_PAUSE && process.env.AGENT_OFFICE_BUDGET_PAUSE !== '0';
+  let maxWorkers = process.env.AGENT_OFFICE_MAX_WORKERS || '';
   let webhook = process.env.AGENT_OFFICE_WEBHOOK;
   let city = process.env.AGENT_OFFICE_CITY || '';
   let weather = process.env.AGENT_OFFICE_WEATHER || '';
@@ -211,7 +230,9 @@ export function loadConfig(argv: string[]): Config {
         agentCmd = takeValue(argv, i++, a);
         break;
       case '--agent-args':
-        agentArgs = splitArgs(takeValue(argv, i++, a));
+        // Its value is flags itself ("--model opus"), so a leading -- doesn't mean the value is missing.
+        if (argv[i + 1] === undefined) takeValue(argv, i, a);
+        agentArgs = splitArgs(argv[++i]);
         break;
       case '--tls-cert':
         tlsCert = takeValue(argv, i++, a);
@@ -239,6 +260,9 @@ export function loadConfig(argv: string[]): Config {
         break;
       case '--budget-pause':
         budgetPause = true;
+        break;
+      case '--max-workers':
+        maxWorkers = takeValue(argv, i++, a);
         break;
       case '--webhook':
         webhook = takeValue(argv, i++, a);
@@ -276,7 +300,7 @@ export function loadConfig(argv: string[]): Config {
   }
   const dir = project || home;
   // New floors go next to the office's data when it has a home of its own, and never into a project.
-  const projectsDir = projects || (project ? path.join(os.homedir(), 'agent-office') : home);
+  const projectsDir = project ? path.join(os.homedir(), 'agent-office') : home;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     console.error('agent-office: invalid --port');
     process.exit(2);
@@ -284,6 +308,11 @@ export function loadConfig(argv: string[]): Config {
   const budgetUsd = budget ? Number(budget.replace(/^\$/, '')) : undefined;
   if (budgetUsd !== undefined && !(budgetUsd > 0)) {
     console.error('agent-office: --budget needs an amount in dollars, e.g. --budget 20');
+    process.exit(2);
+  }
+  const workerLimit = maxWorkers ? parseWorkerLimit(maxWorkers) : undefined;
+  if (maxWorkers && workerLimit === undefined) {
+    console.error(`agent-office: --max-workers needs a whole number from 1 to ${MAX_WORKER_LIMIT}, e.g. --max-workers 6`);
     process.exit(2);
   }
   weather = weather.trim().toLowerCase();
@@ -353,6 +382,7 @@ export function loadConfig(argv: string[]): Config {
     dir,
     dataDir,
     projectsDir,
+    projects: projects || undefined,
     project: project || undefined,
     host,
     port,
@@ -378,6 +408,7 @@ export function loadConfig(argv: string[]): Config {
     publicHost: process.env.AGENT_OFFICE_PUBLIC_HOST || undefined,
     budget: budgetUsd,
     budgetPause,
+    maxWorkers: workerLimit,
     webhook,
     city: city.trim() || undefined,
     weather: (weather as Weather) || undefined,

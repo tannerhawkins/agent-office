@@ -1,7 +1,7 @@
 // Getting around the office floor downstairs (no stairs, no loft, no elevator), round the furniture
 // on a coarse grid: the dog's walks (server/dog.ts), and a worker's way out when it's sent home.
 
-import { BEANBAGS, DESK_SIZE, DESKS, ELEVATOR, ELEVATOR_FRONT, EXIT_DOOR, EXIT_STAIRS, FLOOR, GONG, JUKEBOX, KIOSK, LOFT, PLANTS, ROAD, STAIRS, STATIONS, WHITEBOARD, type DeskDef } from './layout.js';
+import { BALCONY, BALCONY_DOOR, BEANBAGS, BOOKSHELF, CABINET, DESK_SIZE, DESKS, ELEVATOR, ELEVATOR_FRONT, EXIT_DOOR, EXIT_STAIRS, FLOOR, GONG, JUKEBOX, KIOSK, LADDER, LOFT, MEETING_ROOM, MEETING_SEATS, MEETING_TABLE, PARACHUTE, PLANTS, POLE, POLES, ROAD, STAIRS, STATIONS, WHITEBOARD, type DeskDef } from './layout.js';
 
 
 export type Pt = [number, number];
@@ -47,6 +47,14 @@ function obstacles(): { rects: Rect[]; circles: Circle[] } {
   rects.push([WHITEBOARD.x - WHITEBOARD.width / 2 - 0.2, WHITEBOARD.x + WHITEBOARD.width / 2 + 0.2, WHITEBOARD.z - 0.48, WHITEBOARD.z + 0.48]);
   // The jukebox, against the east wall.
   rects.push([JUKEBOX.x - JUKEBOX.depth / 2 - 0.05, FLOOR.maxX, JUKEBOX.z - JUKEBOX.width / 2 - 0.05, JUKEBOX.z + JUKEBOX.width / 2 + 0.05]);
+  // The arcade cabinet next to it, as world/cabinet.ts puts it (its control panel sticks out a little).
+  rects.push([CABINET.x - 0.45, FLOOR.maxX, CABINET.z - CABINET.width / 2 - 0.02, CABINET.z + CABINET.width / 2 + 0.02]);
+  // The bookshelf against the south wall, as world/bookshelf.ts puts it.
+  rects.push([BOOKSHELF.x - BOOKSHELF.width / 2 - 0.04, BOOKSHELF.x + BOOKSHELF.width / 2 + 0.04, BOOKSHELF.z - BOOKSHELF.depth / 2 - 0.03, FLOOR.maxZ]);
+  // The ladder up the west wall, and the fire poles: a hole with a railing round it, or a landing mat.
+  // Which spot has which changes floor by floor, so the dog keeps off both.
+  rects.push([FLOOR.minX, FLOOR.minX + 0.3, LADDER.z - LADDER.width / 2 - 0.05, LADDER.z + LADDER.width / 2 + 0.05]);
+  for (const p of POLES) rects.push([p.x - POLE.rail - 0.05, p.x + POLE.rail + 0.05, p.z - POLE.rail - 0.05, p.z + POLE.rail + 0.05]);
   // The overflow bean bags and their lap desks. They're only out while every desk is taken, but they
   // always come out in the same spots, so the dog keeps off those.
   for (const b of BEANBAGS) {
@@ -61,6 +69,20 @@ function obstacles(): { rects: Rect[]; circles: Circle[] } {
     const xs = corners.map(([x]) => x);
     const zs = corners.map(([, z]) => z);
     rects.push([Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs)]);
+  }
+  // The meeting room under the loft: its glass walls, with the doorway in the north one, and the
+  // table with its chairs, as office.ts puts them.
+  const room = MEETING_ROOM;
+  const G = 0.06;
+  rects.push([room.minX - G, room.minX + G, room.minZ - G, room.maxZ]);
+  rects.push([room.minX - G, room.door.x0, room.minZ - G, room.minZ + G]);
+  rects.push([room.door.x1, room.maxX, room.minZ - G, room.minZ + G]);
+  const t = MEETING_TABLE;
+  rects.push([t.x - t.width / 2, t.x + t.width / 2, t.z - t.depth / 2, t.z + t.depth / 2]);
+  // Chairs tucked in at the table, a little smaller than a desk's, so there's a way round behind them.
+  for (const d of MEETING_SEATS) {
+    const [cx, cz] = deskPoint(d, 0, 0.85);
+    circles.push([cx, cz, 0.3]);
   }
   return { rects, circles };
 }
@@ -249,6 +271,8 @@ class Heap {
 
 /** Just inside the exit door, in the west wall. */
 const EXIT: Pt = [FLOOR.minX + 0.45, EXIT_DOOR.u];
+/** Just inside the balcony doors, in the south wall. */
+const BALCONY_IN: Pt = [BALCONY_DOOR.u, FLOOR.maxZ - 0.45];
 /** Down the middle of the steps outside it. */
 const STEPS_X = (EXIT_STAIRS.minX + EXIT_STAIRS.maxX) / 2;
 /** Along the near sidewalk, between the lot and the trees planted in it. */
@@ -258,6 +282,21 @@ const WALK_OFF_X = -38;
 
 const pathLength = (pts: Pt[]) => pts.reduce((n, p, i) => (i ? n + Math.hypot(p[0] - pts[i - 1][0], p[1] - pts[i - 1][1]) : 0), 0);
 
+/** Where a worker called to a meeting comes in: out of the elevator. */
+const IN_FROM: Pt = [ELEVATOR.x, ELEVATOR_FRONT + 0.5];
+
+/**
+ * A worker's walk in to its seat when it's called to a meeting: out of the elevator and round the
+ * furniture to beside its chair (the last point), on whichever side is the shorter way, where it hops on.
+ */
+export function wayIn(seat: DeskDef): Pt[] {
+  const ways = [-1, 1].map((side) => {
+    const pts = [...route(IN_FROM, deskPoint(seat, side * 0.7, seat.room ? 1.4 : 1.75)), deskPoint(seat, side * 0.7, 0.95)];
+    return { pts, cost: pathLength(pts) };
+  });
+  return ways[0].cost <= ways[1].cost ? ways[0].pts : ways[1].pts;
+}
+
 /**
  * A worker's walk out of the building once it's sent home. The first point is where it hops down,
  * beside its chair (or its bean bag) on whichever side is the shorter way out; then round the
@@ -265,6 +304,27 @@ const pathLength = (pts: Pt[]) => pts.reduce((n, p, i) => (i ? n + Math.hypot(p[
  * street and off along the sidewalk.
  */
 export function wayHome(seat: DeskDef): Pt[] {
+  const inside = wayTo(seat, EXIT);
+  const { landingZ1, steps, run } = EXIT_STAIRS;
+  return [...inside, [STEPS_X, EXIT_DOOR.u], ...walkOff([STEPS_X, landingZ1 + (steps - 1) * run + 0.6])];
+}
+
+/**
+ * The same walk on a floor above the bottom one, which has no exit door: round the furniture to the
+ * balcony doors, out across the balcony and up to its railing (PARACHUTE.jump), where it goes over.
+ */
+export function wayToBalcony(seat: DeskDef): Pt[] {
+  const inside = wayTo(seat, BALCONY_IN);
+  return [...inside, [BALCONY_DOOR.u, BALCONY.minZ + 0.4], [PARACHUTE.jump.x, PARACHUTE.jump.z]];
+}
+
+/** From `from`, down on the street, over to the near sidewalk and off along it to the west, where they're gone. */
+export function walkOff(from: Pt): Pt[] {
+  return [from, [from[0], SIDEWALK_Z], [WALK_OFF_X, SIDEWALK_Z]];
+}
+
+/** From beside `seat`, where it hops down, round the furniture to `door` on the office floor. */
+function wayTo(seat: DeskDef, door: Pt): Pt[] {
   const ways = [-1, 1].map((side) => {
     // Beside the chair and back from the desk into the aisle, off the bean bag and round behind it, or
     // out from behind the kiosk and round its front, into the room.
@@ -272,13 +332,12 @@ export function wayHome(seat: DeskDef): Pt[] {
       ? [deskPoint(seat, side * 1.05, 0.1), deskPoint(seat, side * 1.05, 1.25)]
       : seat.station
         ? [deskPoint(seat, side * 0.95, KIOSK.stand), deskPoint(seat, side * 0.95, -1)]
-        : [deskPoint(seat, side * 0.7, 0.95), deskPoint(seat, side * 0.7, 1.75)];
+        : // At the meeting table there's less room behind the chair, before the glass.
+          [deskPoint(seat, side * 0.7, 0.95), deskPoint(seat, side * 0.7, seat.room ? 1.4 : 1.75)];
     // A bean bag or a kiosk can stand with one side up against something (the elevator, by the queue).
     const blocked = !!(seat.beanbag || seat.station) && !walkable(down[0], down[1]);
-    const pts = [down, ...route(back, EXIT)];
+    const pts = [down, ...route(back, door)];
     return { pts, cost: (blocked ? 1000 : 0) + pathLength(pts) };
   });
-  const inside = ways[0].cost <= ways[1].cost ? ways[0].pts : ways[1].pts;
-  const { landingZ1, steps, run } = EXIT_STAIRS;
-  return [...inside, [STEPS_X, EXIT_DOOR.u], [STEPS_X, landingZ1 + (steps - 1) * run + 0.6], [STEPS_X, SIDEWALK_Z], [WALK_OFF_X, SIDEWALK_Z]];
+  return ways[0].cost <= ways[1].cost ? ways[0].pts : ways[1].pts;
 }

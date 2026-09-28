@@ -1,9 +1,10 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { BRANCH_TEMPLATE_MAX, templateError } from '../shared/branches.js';
 import { FLOOR_PALETTES, MAX_FLOORS, normalizeRepo, sameRepo } from '../shared/floors.js';
-import type { RepoChoice } from '../shared/protocol.js';
+import type { ProjectsDirState, RepoChoice } from '../shared/protocol.js';
 import { gh } from './github.js';
 
 /** A floor as floors.json keeps it. */
@@ -20,6 +21,20 @@ export interface FloorDef {
   branchTemplate?: string;
 }
 
+/** A projects folder picked in ⚙️ Settings (or with --projects), as projects-folder.json keeps it. */
+interface PickedDir {
+  dir: string;
+  by: string;
+  at: number;
+}
+
+/** The checkout the office was started in, once it's been taken off the building (local-floor.json). */
+interface LocalOff {
+  dir: string;
+  by: string;
+  at: number;
+}
+
 /** How long the list of repositories `gh` can see is reused before it's asked again. */
 const REPOS_TTL_MS = 5 * 60_000;
 const MAX_REPOS = 1000;
@@ -28,23 +43,71 @@ const CLONE_TIMEOUT_MS = 30 * 60_000;
 /**
  * The floors of the building, saved in <office>/.agent-office/floors.json: which projects there are,
  * where their checkouts live, and how each floor is painted. New floors are cloned with the office
- * machine's `gh` login into <projects>/<owner>/<repo>.
+ * machine's `gh` login into <projects>/<owner>/<repo>; the projects folder can be picked in ⚙️ Settings
+ * (kept in projects-folder.json).
  */
 export class Building {
   private defs: FloorDef[] = [];
   private file: string;
+  private pickedFile: string;
+  private picked?: PickedDir;
   /** Floors being cloned, by lower-cased repo. Not saved until the clone is there. */
   private cloning = new Map<string, FloorDef>();
   private repoCache?: { at: number; repos: Promise<RepoChoice[]> };
+  /** The checkout the office was started in (see ensureLocal), and the repository it's a checkout of. */
+  private local?: { dir: string; repo?: string };
+  /** The floor that checkout is, while it is one. */
+  private localId?: string;
+  private localFile: string;
+  /** That checkout was taken off the building: a restart doesn't put it back. */
+  private localOff?: LocalOff;
 
   constructor(
     /** The office's own data folder; `gh` runs there, since the projects folder may not exist yet. */
     private dataDir: string,
-    /** Where new floors are cloned. */
-    readonly projectsDir: string,
+    /** Where new floors are cloned unless another folder was picked. */
+    private defaultProjectsDir: string,
   ) {
     this.file = path.join(dataDir, 'floors.json');
+    this.pickedFile = path.join(dataDir, 'projects-folder.json');
+    this.localFile = path.join(dataDir, 'local-floor.json');
     this.load();
+    this.loadPicked();
+    this.loadLocalOff();
+  }
+
+  /** Where new floors are cloned. Floors already there stay where they are when it moves. */
+  get projectsDir(): string {
+    return this.picked?.dir ?? this.defaultProjectsDir;
+  }
+
+  projectsDirState(): ProjectsDirState {
+    return { dir: tildify(this.projectsDir), custom: !!this.picked, by: this.picked?.by, at: this.picked?.at };
+  }
+
+  /** Clones new floors into `raw` from now on ('~' is the home folder; '' goes back to the default). Returns why it can't, if it can't. */
+  setProjectsDir(raw: string, by: string): string | undefined {
+    const text = raw.trim();
+    let dir = this.defaultProjectsDir;
+    if (text) {
+      const typed = untildify(text);
+      if (!path.isAbsolute(typed)) return 'Use a full path, like ~/Workspace';
+      dir = path.resolve(typed);
+    }
+    if (dir !== this.defaultProjectsDir) {
+      const why = unwritable(dir);
+      if (why) return why;
+      // Cloning into a project would nest checkouts inside its git tree.
+      const inside = this.defs.find((d) => within(dir, path.resolve(d.dir)));
+      if (inside) return `${tildify(dir)} is inside ${inside.name}'s checkout — pick a folder outside every project`;
+    }
+    this.picked = dir === this.defaultProjectsDir ? undefined : { dir, by, at: Date.now() };
+    try {
+      writeFileSync(this.pickedFile, JSON.stringify(this.picked ?? {}, null, 2), { mode: 0o600 });
+    } catch (err) {
+      console.error(`agent-office: couldn't save the projects folder: ${(err as Error).message}`);
+    }
+    return undefined;
   }
 
   list(): FloorDef[] {
@@ -70,16 +133,47 @@ export class Building {
   }
 
   /**
-   * Makes the checkout the office was started in a floor, if it isn't one yet. It's the office's own
-   * project: `agent-office <dir>` has always meant that one.
+   * Makes the checkout the office was started in a floor, if it isn't one yet: `agent-office <dir>`
+   * has always meant that project. Once someone takes it off the building it stays off (the office
+   * still keeps its own data in it), until its repository is added again from the elevator.
    */
-  ensureLocal(dir: string, by: string): FloorDef {
+  ensureLocal(dir: string, by: string): FloorDef | undefined {
     const abs = path.resolve(dir);
     const known = this.defs.find((d) => path.resolve(d.dir) === abs);
-    if (known) return known;
+    this.local = { dir: abs, repo: known?.repo ?? originRepo(abs) };
+    if (known) {
+      this.localId = known.id;
+      if (this.localOff) this.setLocalOff(undefined);
+      return known;
+    }
+    if (this.localOff && path.resolve(this.localOff.dir) === abs) return undefined;
     // Named after its folder, as the office always called it.
-    const def = this.newDef(path.basename(abs), originRepo(abs), abs, by);
+    const def = this.newDef(path.basename(abs), this.local.repo, abs, by);
     this.defs.unshift(def);
+    this.localId = def.id;
+    this.save();
+    return def;
+  }
+
+  /** The office keeps its own data in this floor's checkout. */
+  isLocal(id: string): boolean {
+    return id === this.localId;
+  }
+
+  /**
+   * Takes a floor off the building. Its checkout stays where it is, with its workers, queue and
+   * pictures in its .agent-office folder: adding the repository again moves back in, as long as the
+   * checkout is still where the projects folder clones it (or it's the one the office was started
+   * in). Returns the floor, or why it can't.
+   */
+  remove(id: string, by = '?'): FloorDef | string {
+    const def = this.defs.find((d) => d.id === id);
+    if (!def) return [...this.cloning.values()].some((d) => d.id === id) ? "That floor is still being cloned — take it off once it's there" : 'No such floor';
+    this.defs = this.defs.filter((d) => d !== def);
+    if (this.isLocal(id)) {
+      this.localId = undefined;
+      this.setLocalOff({ dir: def.dir, by, at: Date.now() });
+    }
     this.save();
     return def;
   }
@@ -95,6 +189,17 @@ export class Building {
     if (this.defs.some((d) => sameRepo(d.repo, wanted))) return `${wanted} already has a floor`;
     if (this.cloning.has(wanted.toLowerCase())) return `${wanted} is already being cloned`;
     if (this.defs.length + this.cloning.size >= MAX_FLOORS) return `The building is full (${MAX_FLOORS} floors)`;
+    // The office's own checkout, taken off before: it moves back in where it is, not into a second clone.
+    const home = this.local;
+    if (this.localOff && home && sameRepo(home.repo, wanted) && existsSync(home.dir)) {
+      const def = this.newDef(path.basename(home.dir), home.repo, home.dir, by);
+      started(def);
+      this.defs.push(def);
+      this.localId = def.id;
+      this.setLocalOff(undefined);
+      this.save();
+      return def;
+    }
     // Asking GitHub first says whether this login can see it at all, and gets the name's real case.
     let repo: string;
     try {
@@ -172,6 +277,38 @@ export class Building {
     }
   }
 
+  private loadPicked() {
+    try {
+      const saved = JSON.parse(readFileSync(this.pickedFile, 'utf8')) as Partial<PickedDir>;
+      if (typeof saved.dir === 'string' && path.isAbsolute(saved.dir)) {
+        this.picked = { dir: saved.dir, by: typeof saved.by === 'string' ? saved.by : '?', at: typeof saved.at === 'number' ? saved.at : Date.now() };
+      }
+    } catch {
+      // never picked: the default
+    }
+  }
+
+  private loadLocalOff() {
+    try {
+      const saved = JSON.parse(readFileSync(this.localFile, 'utf8')) as Partial<LocalOff>;
+      if (typeof saved.dir === 'string' && path.isAbsolute(saved.dir)) {
+        this.localOff = { dir: saved.dir, by: typeof saved.by === 'string' ? saved.by : '?', at: typeof saved.at === 'number' ? saved.at : Date.now() };
+      }
+    } catch {
+      // never taken off
+    }
+  }
+
+  private setLocalOff(off: LocalOff | undefined) {
+    this.localOff = off;
+    try {
+      if (off) writeFileSync(this.localFile, JSON.stringify(off, null, 2), { mode: 0o600 });
+      else rmSync(this.localFile, { force: true });
+    } catch (err) {
+      console.error(`agent-office: couldn't save ${this.localFile}: ${(err as Error).message}`);
+    }
+  }
+
   private save() {
     try {
       writeFileSync(this.file, JSON.stringify(this.defs, null, 2), { mode: 0o600 });
@@ -179,6 +316,35 @@ export class Building {
       console.error(`agent-office: couldn't save the floors: ${(err as Error).message}`);
     }
   }
+}
+
+/** A path under the home folder as ~/…, for showing people. */
+export function tildify(p: string): string {
+  const home = os.homedir();
+  return p === home || p.startsWith(home + path.sep) ? `~${p.slice(home.length)}` : p;
+}
+
+function untildify(p: string): string {
+  return p === '~' || p.startsWith('~/') ? path.join(os.homedir(), p.slice(1)) : p;
+}
+
+/** `dir` is `parent` or somewhere under it. */
+function within(dir: string, parent: string): boolean {
+  const rel = path.relative(parent, dir);
+  return !rel || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/** Why the office couldn't make checkouts under `dir`, if it couldn't. It's made on the first clone, so it needn't exist yet. */
+function unwritable(dir: string): string | undefined {
+  let at = dir;
+  while (!existsSync(at) && path.dirname(at) !== at) at = path.dirname(at);
+  try {
+    if (!statSync(at).isDirectory()) return `${tildify(at)} isn't a folder`;
+    accessSync(at, constants.W_OK);
+  } catch {
+    return `The office can't write in ${tildify(at)}`;
+  }
+  return undefined;
 }
 
 /** The GitHub repository a checkout's origin points at. */

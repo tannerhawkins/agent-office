@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { AgentProvider } from '../shared/protocol.js';
+import { isAgentEffort, isClaudeModel, type AgentProvider } from '../shared/protocol.js';
 
 export const OPEN_CODE_MODEL_MAX = 256;
 
@@ -22,6 +22,11 @@ export function providerCommand(provider: AgentProvider): string {
   return provider === 'cursor' ? 'cursor-agent' : provider;
 }
 
+/** The providers an office started with `configured` can hire: the four it knows, and a custom --agent only when that's what it was started with. */
+export function agentProviders(configured: AgentProvider): AgentProvider[] {
+  return configured === 'custom' ? ['claude', 'opencode', 'codex', 'cursor', 'custom'] : ['claude', 'opencode', 'codex', 'cursor'];
+}
+
 /** OpenCode model ids are argv values, so reject anything that could be ambiguous or unsafe. */
 export function isValidOpenCodeModel(value: unknown): value is string {
   if (typeof value !== 'string' || value.length === 0 || value.length > OPEN_CODE_MODEL_MAX) return false;
@@ -32,8 +37,17 @@ export function isValidOpenCodeModel(value: unknown): value is string {
 
 export function validateWorkerModel(kind: 'agent' | 'shell', provider: AgentProvider | undefined, model: unknown): string | undefined {
   if (model === undefined) return undefined;
-  if (kind === 'shell') return 'Shell workers do not have an OpenCode model';
-  if (provider !== 'opencode') return 'Models can only be selected for OpenCode workers';
+  if (kind === 'shell') return 'Shell workers do not have an agent model';
+  if (provider === 'claude') return isClaudeModel(model) ? undefined : 'Invalid Claude model (expected fable, opus, sonnet or haiku)';
+  if (provider !== 'opencode') return 'Models can only be selected for Claude Code or OpenCode workers';
   if (!isValidOpenCodeModel(model)) return 'Invalid OpenCode model (expected provider/model without whitespace)';
   return undefined;
+}
+
+/** Claude Code's own `--effort` flag; no other provider this office launches supports one yet. */
+export function validateWorkerEffort(kind: 'agent' | 'shell', provider: AgentProvider | undefined, effort: unknown): string | undefined {
+  if (effort === undefined) return undefined;
+  if (kind === 'shell') return 'Shell workers do not have a reasoning effort';
+  if (provider !== 'claude') return 'Reasoning effort can only be selected for Claude Code workers';
+  return isAgentEffort(effort) ? undefined : 'Invalid effort (expected low, medium, high, xhigh or max)';
 }

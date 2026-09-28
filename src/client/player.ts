@@ -46,11 +46,26 @@ export class PlayerController {
   jumpBoost = 1;
   /** 0 (steady) to 1: how hard the view trembles after one coffee too many. */
   jitter = 0;
+  /** How far below the floor you're on the street is: further down the higher your floor (see streetBelow). */
+  street = STREET_Y;
   private jitterT = 0;
+  /** How drunk you are (see booze.ts): the view rolls and sways, and you stagger as you walk. */
+  drunk = 0;
   /** Where you're sitting, or null on your feet. You stay put there until you walk off or jump up. */
   seat: SeatPlace | null = null;
   /** You got up by walking off or jumping (not by stand()). */
   onStand: (() => void) | null = null;
+  /** Corners still to walk through on your own (see walkPath), or null while you're steering. */
+  private path: { x: number; z: number }[] | null = null;
+  /** How long a walk along `path` has been getting nowhere. */
+  private stuckFor = 0;
+  /** A walk along a path ended: at its end, by a key of yours, or up against something. */
+  onPathEnd: ((why: 'arrived' | 'cancelled' | 'stuck') => void) | null = null;
+  /**
+   * Something that has hold of you instead of your legs (the ladder, a fire pole): it moves you each
+   * frame, with no walking, falling or bumping into things, and the camera follows.
+   */
+  rig: ((dt: number) => void) | null = null;
   /**
    * A click (not a drag) on the scene, in normalized device coordinates.
    * In first person it is always the crosshair, (0, 0).
@@ -62,12 +77,30 @@ export class PlayerController {
   private lockFailed = false;
   private lockPending = false;
   private everLocked = false;
+  /** Whether a click or key was behind the lock last asked for. Without one, a refusal is just the browser's rule. */
+  private lockOnGesture = false;
+  /** The page is letting go of the mouse itself, which isn't you pressing Esc or another tab taking it. */
+  private letting = false;
+  /**
+   * Whether the page was the one to let go of the mouse last. Only then does the browser hand it
+   * back without a click or key behind the asking, and the Esc that closes a window isn't one.
+   */
+  private letGo = false;
+  /** Asked for while the page was still letting go of it: taken back as soon as it's free. */
+  private lockAfter = false;
+  /** When Esc last went down and hasn't come up yet (0 once it has). */
+  private escDownAt = 0;
+  /** Asked for while Esc was down: taken once it comes up (see lock). */
+  private lockOnEscUp = false;
   enabled = true;
+  /** False while the mouse picks something else (an emote on the wheel), so it doesn't turn the camera. */
+  mouseLook = true;
 
   constructor(
     private camera: THREE.PerspectiveCamera,
     private dom: HTMLElement,
-    private colliders: Collider[],
+    /** What you bump into and stand on: the office's, or the roof's up there. */
+    public colliders: Collider[],
   ) {
     camera.rotation.order = 'YXZ';
     window.addEventListener('keydown', (e) => {
@@ -76,7 +109,28 @@ export class PlayerController {
       if (e.code === 'Space') e.preventDefault();
     });
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this.escDownAt = 0;
+      this.lockOnEscUp = false;
+    });
+    // Captured, since the window an Esc closes stops it going any further.
+    window.addEventListener('keydown', (e) => e.key === 'Escape' && (this.escDownAt = performance.now()), true);
+    window.addEventListener(
+      'keyup',
+      (e) => {
+        if (e.key !== 'Escape') return;
+        this.escDownAt = 0;
+        const again = this.lockOnEscUp && this.enabled && this.canLock;
+        this.lockOnEscUp = false;
+        if (!again) return;
+        // Taken here, the browser doesn't also treat this Esc as its own shortcut once the page is done
+        // with it, which would let go of the mouse just taken.
+        e.preventDefault();
+        this.lock();
+      },
+      true,
+    );
 
     dom.addEventListener('pointerdown', (e) => {
       if (!this.enabled) return;
@@ -102,7 +156,10 @@ export class PlayerController {
       }
     });
     window.addEventListener('pointermove', (e) => {
+      if (!this.mouseLook) return;
       if (this.locked) {
+        // Held for a moment under a window (see yieldMouse), the mouse doesn't turn your head.
+        if (!this.enabled) return;
         // Some platforms report a bogus huge jump right after locking.
         const clamp = (v: number) => THREE.MathUtils.clamp(v, -250, 250);
         this.look(clamp(e.movementX) * LOOK_SPEED, clamp(e.movementY) * LOOK_SPEED);
@@ -122,21 +179,20 @@ export class PlayerController {
     });
     document.addEventListener('pointerlockchange', () => {
       this.lockPending = false;
-      // A lock that lands after a modal opened (e.g. a relock racing the next modal) is let go.
-      if (this.locked && !this.enabled) {
-        document.exitPointerLock();
+      if (!this.locked) {
+        this.letGo = this.letting;
+        this.letting = false;
+        const again = this.lockAfter && this.enabled && this.canLock;
+        this.lockAfter = false;
+        if (again) this.lock();
         return;
       }
-      if (this.locked) {
-        this.everLocked = true;
-        this.drag = null;
-      }
+      this.everLocked = true;
+      this.drag = null;
+      // A lock that lands with a window open (the one yieldMouse takes, or a relock racing the next window) is let go.
+      if (!this.enabled) this.unlock();
     });
-    document.addEventListener('pointerlockerror', () => {
-      this.lockPending = false;
-      // Locking right after Esc is refused for a moment; only give up if it never worked.
-      if (!this.everLocked) this.lockFailed = true;
-    });
+    document.addEventListener('pointerlockerror', () => this.refused());
     dom.addEventListener(
       'wheel',
       (e) => {
@@ -149,6 +205,11 @@ export class PlayerController {
 
   get locked(): boolean {
     return document.pointerLockElement === this.dom;
+  }
+
+  /** Whether the mouse is captured and staying so: not while it's being let go of for a window. */
+  get hasMouse(): boolean {
+    return this.locked && !this.letting;
   }
 
   /** Whether clicking the scene will capture the mouse for looking around. */
@@ -171,32 +232,71 @@ export class PlayerController {
   }
 
   unlock() {
-    if (this.locked) document.exitPointerLock();
+    this.lockAfter = false;
+    this.lockOnEscUp = false;
+    if (!this.locked) return;
+    this.letting = true;
+    document.exitPointerLock();
+  }
+
+  /**
+   * Frees the mouse for a window over the game, so that `lock` gets it back when the window closes.
+   * The browser only hands the mouse back without a click or key to a page that let go of it itself.
+   * So when the mouse is free already (you pressed Esc to click something on screen), the click or
+   * key that opens the window takes it for a moment, and it's let go as soon as it lands.
+   */
+  yieldMouse() {
+    if (this.locked) return this.unlock();
+    if (this.letGo || !this.canLock || !navigator.userActivation?.isActive) return;
+    this.lock();
   }
 
   clearKeys() {
     this.keys.clear();
   }
 
+  /** Whether any of these keys is held down (and you have the controls). */
+  holding(...codes: string[]): boolean {
+    return this.enabled && codes.some((c) => this.keys.has(c));
+  }
+
   /** Captures the mouse for looking around, as the first click on the scene does. */
   lock() {
+    // Still being let go of, for a window that closed again at once: taken back once it's free.
+    if (this.locked && this.letting) this.lockAfter = true;
     if (this.locked || this.lockPending) return;
+    // The browser lets go of the mouse on Esc coming up as well as going down, so a lock taken
+    // between the two (the Esc that closed a window) is gone again at once, and with it the leave
+    // to take it back without a click. Asked for once Esc is up instead, from its keyup (see there).
+    // A second on, Esc being held would have repeated, so its keyup went missing.
+    if (this.escDownAt && performance.now() - this.escDownAt < 1000) {
+      this.lockOnEscUp = true;
+      return;
+    }
+    this.lockOnEscUp = false;
     if (typeof this.dom.requestPointerLock !== 'function') {
       this.lockFailed = true;
       return;
     }
     this.lockPending = true;
+    this.lockOnGesture = navigator.userActivation?.isActive ?? true;
+    // Asking uses up the browser's leave to hand the mouse back, whatever it answers.
+    this.letGo = false;
     try {
       // Newer browsers return a promise; older ones report through pointerlockerror.
       const p = this.dom.requestPointerLock() as unknown as Promise<void> | undefined;
-      p?.catch?.(() => {
-        this.lockPending = false;
-        if (!this.everLocked) this.lockFailed = true;
-      });
+      p?.catch?.(() => this.refused());
     } catch {
       this.lockPending = false;
       this.lockFailed = true;
     }
+  }
+
+  private refused() {
+    this.lockPending = false;
+    // Locking right after Esc is refused for a moment, and so is asking with no click or key behind
+    // it; only give up if it never worked when a click or key asked.
+    if (!this.everLocked && this.lockOnGesture) this.lockFailed = true;
   }
 
   private look(dx: number, dy: number) {
@@ -236,6 +336,16 @@ export class PlayerController {
     }
   }
 
+  /** Walks you through these corners by yourself until you get there, or take a step or a jump of your own. */
+  walkPath(points: { x: number; z: number }[]) {
+    this.path = points.length ? points.map((p) => ({ ...p })) : null;
+    this.stuckFor = 0;
+  }
+
+  stopWalking() {
+    this.path = null;
+  }
+
   /** How far sitting moves your hips (and eyes) from where they are standing. */
   private get lift(): number {
     return this.seat ? this.seat.hips - HIPS : 0;
@@ -244,6 +354,16 @@ export class PlayerController {
   update(dt: number) {
     dt = Math.min(dt, 0.05);
     const k = this.keys;
+    if (this.rig) {
+      this.rig(dt);
+      this.vy = 0;
+      this.grounded = false;
+      this.stepOffset *= Math.exp(-dt * 16);
+      this.bob = 0;
+      this.jitterT += dt;
+      this.updateCamera();
+      return;
+    }
     if (this.seat) {
       if (!this.enabled || !GET_UP.some((c) => k.has(c))) {
         this.moving = false;
@@ -263,15 +383,24 @@ export class PlayerController {
       if (k.has('KeyA') || k.has('ArrowLeft')) ix -= 1;
       if (k.has('KeyD') || k.has('ArrowRight')) ix += 1;
     }
-    this.moving = ix !== 0 || iz !== 0;
+    const steering = ix !== 0 || iz !== 0;
+    this.moving = steering;
+    if (this.path && (steering || (this.enabled && k.has('Space')))) {
+      this.path = null;
+      this.onPathEnd?.('cancelled');
+    }
+    if (this.path && this.enabled) this.followPath(dt);
     if (this.view === 'first') this.facing = Math.atan2(Math.sin(this.camYaw + Math.PI), Math.cos(this.camYaw + Math.PI));
-    if (this.moving) {
+    if (steering) {
       const len = Math.hypot(ix, iz);
       ix /= len;
       iz /= len;
       // Camera-relative: "forward" is where the camera looks.
-      const sin = Math.sin(this.camYaw);
-      const cos = Math.cos(this.camYaw);
+      // Drunk, your feet wander off to one side and then the other.
+      const t = this.jitterT;
+      const stagger = this.drunk * (0.4 * Math.sin(t * 1.6) + 0.22 * Math.sin(t * 3.7 + 1));
+      const sin = Math.sin(this.camYaw + stagger);
+      const cos = Math.cos(this.camYaw + stagger);
       const dx = ix * cos + iz * sin;
       const dz = -ix * sin + iz * cos;
       const speed = (k.has('ShiftLeft') || k.has('ShiftRight') ? RUN : WALK) * this.speedBoost;
@@ -285,7 +414,8 @@ export class PlayerController {
       }
     }
 
-    const ground = groundAt(this.colliders, this.pos.x, this.pos.z, this.pos.y);
+    // Never below the street: past the edge of the grass there's nothing else to stand on.
+    const ground = Math.max(groundAt(this.colliders, this.pos.x, this.pos.z, this.pos.y), this.street);
     const jump = this.enabled && k.has('Space') && this.grounded;
     if (jump) {
       this.vy = JUMP_V * this.jumpBoost;
@@ -318,6 +448,42 @@ export class PlayerController {
     this.updateCamera();
   }
 
+  /** A step along `path`: toward its next corner, turning (and in first person, looking) the way you go. */
+  private followPath(dt: number) {
+    const path = this.path!;
+    const next = path[0];
+    const dx = next.x - this.pos.x;
+    const dz = next.z - this.pos.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 0.25) {
+      path.shift();
+      if (!path.length) {
+        this.path = null;
+        this.onPathEnd?.('arrived');
+      }
+      return;
+    }
+    // Run the long way round, walk the last few meters.
+    let left = dist;
+    for (let i = 1; i < path.length; i++) left += Math.hypot(path[i].x - path[i - 1].x, path[i].z - path[i - 1].z);
+    const step = Math.min(dist, (left > 6 ? RUN : WALK) * this.speedBoost * dt);
+    const x0 = this.pos.x;
+    const z0 = this.pos.z;
+    this.tryMove(this.pos.x + (dx / dist) * step, this.pos.z);
+    this.tryMove(this.pos.x, this.pos.z + (dz / dist) * step);
+    this.moving = true;
+    const want = Math.atan2(dx, dz);
+    const ease = Math.min(1, dt * 8);
+    if (this.view === 'first') this.camYaw += Math.atan2(Math.sin(want + Math.PI - this.camYaw), Math.cos(want + Math.PI - this.camYaw)) * ease;
+    else this.facing += Math.atan2(Math.sin(want - this.facing), Math.cos(want - this.facing)) * ease;
+    // Up against something the map didn't know about: give up rather than walk on the spot.
+    this.stuckFor = Math.hypot(this.pos.x - x0, this.pos.z - z0) < step * 0.2 ? this.stuckFor + dt : 0;
+    if (this.stuckFor > 1) {
+      this.path = null;
+      this.onPathEnd?.('stuck');
+    }
+  }
+
   updateCamera(snap = false) {
     if (this.view === 'first') {
       this.camera.position.set(this.pos.x, this.pos.y + EYE_HEIGHT + this.bob + this.stepOffset + this.lift, this.pos.z);
@@ -336,24 +502,27 @@ export class PlayerController {
     // room while you're in the office, out of the building while you're outside or on the balcony.
     // And under the loft, its roof or the garage ceiling.
     const m = 0.4;
-    const indoors = this.pos.y > -SLAB - 0.5 && this.pos.x > FLOOR.minX && this.pos.x < FLOOR.maxX && this.pos.z > FLOOR.minZ && this.pos.z < FLOOR.maxZ;
+    // On the ladder or a pole you can be down in a shaft under the floor, but you're still indoors.
+    const rigged = !!this.rig;
+    const indoors = (rigged || this.pos.y > -SLAB - 0.5) && this.pos.x > FLOOR.minX && this.pos.x < FLOOR.maxX && this.pos.z > FLOOR.minZ && this.pos.z < FLOOR.maxZ;
     if (indoors) {
       cam.x = THREE.MathUtils.clamp(cam.x, FLOOR.minX + m, FLOOR.maxX - m);
       cam.z = THREE.MathUtils.clamp(cam.z, FLOOR.minZ + m, FLOOR.maxZ - m);
     }
-    const floorY = groundAt(this.colliders, this.pos.x, this.pos.z, this.pos.y);
+    const floorY = rigged ? 0 : Math.max(groundAt(this.colliders, this.pos.x, this.pos.z, this.pos.y), this.street);
     const roof = ceilingAt(this.colliders, cam.x, cam.z, floorY) - 0.3;
     cam.y = THREE.MathUtils.clamp(cam.y, floorY + 0.6, Math.max(floorY + 0.6, Math.min(floorY + 3.5, roof)));
     // Down on the street, stay under the garage ceiling so its edge never cuts across the view.
-    if (this.pos.y < -SLAB - 1) cam.y = Math.min(cam.y, Math.max(floorY + 0.6, -SLAB - 0.3));
+    const garage = this.street - STREET_Y - SLAB;
+    if (this.pos.y < garage - 1 && !rigged) cam.y = Math.min(cam.y, Math.max(floorY + 0.6, garage - 0.3));
     // How far you are out past each outside wall (west, east, north, south), and how far inside them the camera is.
     const e = WALL_T + m;
     const out = [FLOOR.minX - WALL_T - this.pos.x, this.pos.x - FLOOR.maxX - WALL_T, FLOOR.minZ - WALL_T - this.pos.z, this.pos.z - FLOOR.maxZ - WALL_T];
     const side = out.indexOf(Math.max(...out));
     const camIn = Math.min(cam.x - (FLOOR.minX - e), FLOOR.maxX + e - cam.x, cam.z - (FLOOR.minZ - e), FLOOR.maxZ + e - cam.z) > 0;
-    // Outside, back the camera out through the wall you're standing beyond: upstairs always, and
-    // downstairs where the garage is walled in (the west and north sides).
-    if (!indoors && out[side] > 0 && camIn && (cam.y > -SLAB || side === 0 || side === 2)) {
+    // Outside, back the camera out through the wall you're standing beyond: above the garage always,
+    // and down in it where it's walled in (the west and north sides).
+    if (!indoors && out[side] > 0 && camIn && (cam.y > garage || side === 0 || side === 2)) {
       if (side === 0) cam.x = FLOOR.minX - e;
       else if (side === 1) cam.x = FLOOR.maxX + e;
       else if (side === 2) cam.z = FLOOR.minZ - e;
@@ -365,11 +534,17 @@ export class PlayerController {
     this.shake();
   }
 
-  /** The jitters: the view trembles a little, on top of wherever you're looking. */
+  /** The jitters: the view trembles a little, on top of wherever you're looking. Drunk, it rolls and sways. */
   private shake() {
+    const t = this.jitterT;
+    if (this.drunk > 0) {
+      const d = this.drunk;
+      this.camera.rotation.z += d * (0.07 * Math.sin(t * 0.9) + 0.025 * Math.sin(t * 2.3 + 1));
+      this.camera.rotation.x += d * 0.03 * Math.sin(t * 0.7 + 2);
+      this.camera.rotation.y += d * 0.04 * Math.sin(t * 0.55 + 4);
+    }
     if (this.jitter <= 0) return;
     const a = this.jitter * 0.01;
-    const t = this.jitterT;
     this.camera.rotation.x += a * (Math.sin(t * 71) + 0.6 * Math.sin(t * 131 + 1));
     this.camera.rotation.y += a * (Math.sin(t * 89 + 2) + 0.6 * Math.sin(t * 157));
     this.camera.rotation.z += a * Math.sin(t * 113 + 3);
@@ -454,11 +629,14 @@ function touches(c: Collider, x: number, z: number, r: number): boolean {
   return (x - nx) ** 2 + (z - nz) ** 2 < r * r;
 }
 
-/** The floor under someone standing at (x, z) with their feet at `y`: the highest top they're on or above, else the street. */
-export function groundAt(colliders: Collider[], x: number, z: number, y: number): number {
-  let g = STREET_Y;
+/**
+ * The floor under someone standing at (x, z) with their feet at `y`: the highest top they're on or
+ * above (out of doors, the street's). Without `fences`, what's there only to keep people out doesn't count.
+ */
+export function groundAt(colliders: Collider[], x: number, z: number, y: number, fences = true): number {
+  let g = -Infinity;
   for (const c of colliders) {
-    if (c.top > 50 || y < c.top - 0.1 || c.top <= g) continue;
+    if (c.top > 50 || y < c.top - 0.1 || c.top <= g || (c.fence && !fences)) continue;
     if (touches(c, x, z, RADIUS)) g = c.top;
   }
   return g;
