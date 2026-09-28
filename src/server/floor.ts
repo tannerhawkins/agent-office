@@ -133,6 +133,9 @@ export class Floor {
       ctx.ledger,
     );
 
+    // Read each time, so a new template applies to the next hire.
+    this.workers.branchTemplate = () => def.branchTemplate;
+
     this.github = new GitHub(
       def.dir,
       (state) => ctx.emit(this, { t: 'gh.issues', state }),
@@ -215,6 +218,7 @@ export class Floor {
       palette: this.def.palette,
       addedBy: this.def.addedBy,
       addedAt: this.def.addedAt,
+      branchTemplate: this.def.branchTemplate,
       workers: ws.length,
       busy: ws.filter((w) => w.status === 'working').length,
       waiting: ws.filter((w) => w.kind === 'agent' && (w.status === 'needs_input' || (w.status === 'done' && !w.acked))).length,

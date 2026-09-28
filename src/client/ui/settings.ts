@@ -3,6 +3,7 @@ import { store, type Settings, type ViewMode } from '../state';
 import { askNotifyPermission, notifyPermission, type DesktopNotifier } from '../notify';
 import type { WebhookKind } from '../../shared/protocol';
 import { DOG_NAME_MAX, cleanDogName } from '../../shared/dog';
+import { BRANCH_PLACEHOLDERS, BRANCH_TEMPLATE_MAX, DEFAULT_BRANCH_TEMPLATE, branchName, templateError } from '../../shared/branches';
 import { h, openModal, timeAgo } from './dom';
 
 const VIEWS: [ViewMode, string, string][] = [
@@ -190,6 +191,52 @@ export function openSettings(net: Net, settings: Settings, onChange: (s: Setting
     if (e.key === 'Enter') renameDog();
   });
 
+  // How this floor names its workers' worktree branches.
+  const branchInput = h('input', { type: 'text', maxlength: BRANCH_TEMPLATE_MAX, 'aria-label': 'Branch name template', placeholder: DEFAULT_BRANCH_TEMPLATE, spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const branchSave = h('button.btn.primary', { type: 'button' }, 'Save');
+  const branchReset = h('button.btn', { type: 'button' }, 'Use the default');
+  const branchPreview = h('p.setting-note');
+  const branchSection = h(
+    'div',
+    {},
+    h('label', { style: 'margin-top:18px' }, '🌿 Branch names on this floor'),
+    h('div.webhook', {}, branchInput, branchSave),
+    h('div.seg', { style: 'margin-top:8px' }, branchReset),
+    branchPreview,
+    h('p.setting-note', {}, `When a worker gets its own worktree, its branch is named like this. Placeholders: ${BRANCH_PLACEHOLDERS.map((p) => `{${p}}`).join(' ')}. {slug} is the task's first words; {issue} drops out when there's no issue. A name that's taken gets -2. It's for everyone on this floor, and applies to the next worker hired.`),
+  );
+  let branchSaved: string | undefined;
+  const previewBranch = () => {
+    const t = branchInput.value.trim() || branchSaved || DEFAULT_BRANCH_TEMPLATE;
+    const err = templateError(t);
+    branchPreview.classList.toggle('bad', !!err);
+    branchPreview.textContent = err
+      ? `⚠️ ${err}`
+      : `e.g. ${branchName(t, { user: store.me.account?.name ?? 'sam', worker: 'Pixel', id: 'a1b2', issue: 42, task: 'Fix the login redirect' })}, or ${branchName(t, { user: store.me.account?.name ?? 'sam', worker: 'Pixel', id: 'a1b2', task: 'Add dark mode' })} without an issue`;
+  };
+  const paintBranch = () => {
+    const floor = store.currentFloor();
+    branchSection.classList.toggle('hidden', !floor);
+    if (branchSaved !== floor?.branchTemplate) {
+      branchSaved = floor?.branchTemplate;
+      branchInput.value = branchSaved ?? '';
+    }
+    branchReset.classList.toggle('hidden', !branchSaved);
+    previewBranch();
+  };
+  paintBranch();
+  const saveBranch = () => {
+    const t = branchInput.value.trim();
+    if (templateError(t)) return branchInput.focus();
+    net.send({ t: 'floor.branchTemplate', template: t });
+  };
+  branchInput.addEventListener('input', previewBranch);
+  branchSave.addEventListener('click', saveBranch);
+  branchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveBranch();
+  });
+  branchReset.addEventListener('click', () => net.send({ t: 'floor.branchTemplate', template: '' }));
+
   const account = store.me.account;
   const signOut = h('button.btn', { type: 'button' }, '🚪 Sign out');
   signOut.addEventListener('click', onSignOut);
@@ -226,6 +273,7 @@ export function openSettings(net: Net, settings: Settings, onChange: (s: Setting
       hookActions,
       hookStatus,
       dogSection,
+      branchSection,
       h('label', { style: 'margin-top:18px' }, 'Your character'),
       character,
       h('label', { style: 'margin-top:18px' }, 'Signed in'),
@@ -235,10 +283,12 @@ export function openSettings(net: Net, settings: Settings, onChange: (s: Setting
   );
   const offNotify = store.on('notify', paintHook);
   const offDog = store.on('dog', paintDog);
+  const offFloors = store.on('floors', paintBranch);
   const modal = openModal(el, {
     onClose: () => {
       offNotify();
       offDog();
+      offFloors();
     },
   });
   close.addEventListener('click', () => modal.close());

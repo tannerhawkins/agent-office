@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -772,4 +773,29 @@ process.stdin.resume();
   await waitFor(() => workers.get(worker.id)?.status, s => s === 'working');
   assert.equal(hook('stop', { status: 'completed' }), true);
   assert.equal(workers.get(worker.id)?.status, 'done');
+});
+
+test("worktree workers' branches follow the floor's template", async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  t.after(() => f.close());
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: f.root, encoding: 'utf8' }).trim();
+  git('init', '-q', '-b', 'main');
+  git('commit', '-q', '--allow-empty', '-m', 'start');
+  mkdirSync(path.join(f.root, '.agent-office'));
+
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  const def = workers.spawn('desk-1', 'Sam', 'fix the login', true);
+  assert.match(typeof def === 'object' ? def.worktree!.branch : def, /^office\/[a-z]+-[0-9a-f]{4}$/);
+
+  let template: string | undefined = '{user}/{issue}-{slug}';
+  workers.branchTemplate = () => template;
+  const queued = workers.spawn('desk-2', 'Sam (queue)', 'long prompt text', true, 'agent', 'claude', undefined, { title: 'Add dark mode', issue: 7, user: 'Robin' });
+  assert.equal(typeof queued === 'object' && queued.worktree!.branch, 'robin/7-add-dark-mode');
+  const handed = workers.spawn('desk-3', 'Sam', 'Work on GitHub issue #42: "Login breaks".\n\nRead it first', true);
+  assert.equal(typeof handed === 'object' && handed.worktree!.branch, 'sam/42-login-breaks');
+  template = 'feat/{slug}';
+  const plain = workers.spawn('desk-4', 'Sam', 'Add dark mode', true);
+  assert.equal(typeof plain === 'object' && plain.worktree!.branch, 'feat/add-dark-mode');
 });

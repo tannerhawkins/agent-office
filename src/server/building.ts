@@ -1,6 +1,7 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { BRANCH_TEMPLATE_MAX, templateError } from '../shared/branches.js';
 import { FLOOR_PALETTES, MAX_FLOORS, normalizeRepo, sameRepo } from '../shared/floors.js';
 import type { RepoChoice } from '../shared/protocol.js';
 import { gh } from './github.js';
@@ -15,6 +16,8 @@ export interface FloorDef {
   palette: number;
   addedBy: string;
   addedAt: number;
+  /** How workers' worktree branches are named here (see shared/branches.ts); missing is the default. */
+  branchTemplate?: string;
 }
 
 /** How long the list of repositories `gh` can see is reused before it's asked again. */
@@ -46,6 +49,19 @@ export class Building {
 
   list(): FloorDef[] {
     return this.defs;
+  }
+
+  /** Sets how a floor names its workers' branches; '' goes back to the default. Returns what's wrong with it, if anything. */
+  setBranchTemplate(id: string, template: string): string | undefined {
+    const def = this.defs.find((d) => d.id === id);
+    if (!def) return 'No such floor';
+    const t = template.trim();
+    const err = templateError(t);
+    if (err) return err;
+    if (t) def.branchTemplate = t;
+    else delete def.branchTemplate;
+    this.save();
+    return undefined;
   }
 
   /** Floors on their way: shown in the elevator, but nobody can ride there yet. */
@@ -148,6 +164,7 @@ export class Building {
           palette: Number.isInteger(s.palette) && (s.palette as number) >= 0 ? (s.palette as number) : 0,
           addedBy: typeof s.addedBy === 'string' ? s.addedBy : '?',
           addedAt: typeof s.addedAt === 'number' ? s.addedAt : Date.now(),
+          ...(typeof s.branchTemplate === 'string' && s.branchTemplate.length <= BRANCH_TEMPLATE_MAX && !templateError(s.branchTemplate) ? { branchTemplate: s.branchTemplate.trim() } : {}),
         });
       }
     } catch (err) {

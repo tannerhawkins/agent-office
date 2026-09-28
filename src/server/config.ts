@@ -71,7 +71,7 @@ started in a project where an office already ran), it keeps its data in
 
 Commands:
   prune                   Remove leftover worker worktrees (.agent-office/worktrees/)
-                          and their office/* branches. Anything with uncommitted
+                          and the branches the office cut. Anything with uncommitted
                           changes or unpushed commits is kept unless --force is given.
   accounts                Invite, list and revoke people's own accounts, and switch
                           the shared password off or on (see accounts --help)

@@ -4,13 +4,14 @@ import path from 'node:path';
 import { isAgentProvider, type AgentProvider, type GhPull, type QueueState, type QueueTask, type WorkerInfo, type WorkerStatus } from '../shared/protocol.js';
 import { DESK_BY_ID, SEATS, nextFreeSeat } from '../shared/layout.js';
 import { isValidOpenCodeModel, validateWorkerModel } from './agents.js';
+import type { BranchTask } from './workers.js';
 
 /** What the queue needs from the worker manager. Narrow on purpose, so a smoke test can fake it. */
 export interface QueueWorkers {
   readonly defaultProvider: AgentProvider;
   list(): WorkerInfo[];
   deskOccupied(deskId: string): boolean;
-  spawn(deskId: string, by: string, prompt: string, worktree: boolean, kind: 'agent', provider: AgentProvider, model?: string): WorkerInfo | string;
+  spawn(deskId: string, by: string, prompt: string, worktree: boolean, kind: 'agent', provider: AgentProvider, model?: string, task?: BranchTask): WorkerInfo | string;
   /** Resolves with a line about what became of the worker's worktree. */
   kill(id: string): Promise<{ note?: string; error?: string }>;
 }
@@ -291,7 +292,11 @@ export class TaskQueue {
       if (this.events.hiringPaused()) break;
       const desk = this.freeDesk() ?? this.recycleDesk();
       if (!desk) break;
-      const r = this.workers.spawn(desk, `${t.addedBy} (queue)`, t.prompt + (this.useWorktree ? WORKTREE_NOTE : ''), this.useWorktree, 'agent', t.provider ?? this.workers.defaultProvider, t.model);
+      const r = this.workers.spawn(desk, `${t.addedBy} (queue)`, t.prompt + (this.useWorktree ? WORKTREE_NOTE : ''), this.useWorktree, 'agent', t.provider ?? this.workers.defaultProvider, t.model, {
+        title: t.title,
+        issue: t.issue,
+        user: t.addedBy,
+      });
       changed = true;
       if (typeof r === 'string') {
         t.status = 'done';

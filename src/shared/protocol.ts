@@ -381,6 +381,8 @@ export interface FloorInfo {
   cloning?: boolean;
   addedBy: string;
   addedAt: number;
+  /** How workers' worktree branches are named on this floor (see shared/branches.ts); missing is the default. */
+  branchTemplate?: string;
   /** For the elevator panel: who's there and what they're up to. */
   workers: number;
   busy: number;
@@ -730,6 +732,8 @@ export type ClientMsg =
   | { t: 'dog.pet' }
   /** Name the dog on your floor ('' gives it back its first name). */
   | { t: 'dog.name'; name: string }
+  /** Set how this floor names its workers' branches; '' goes back to the default. */
+  | { t: 'floor.branchTemplate'; template: string }
   | { t: 'ping'; at: number };
 
 export type ServerMsg =

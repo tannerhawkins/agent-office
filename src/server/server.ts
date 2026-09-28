@@ -991,6 +991,19 @@ export async function startServer(cfg: Config) {
         toastFloor(floor, `🐶 ${who} named the dog ${name}`);
         break;
       }
+      case 'floor.branchTemplate': {
+        const floor = here();
+        if (!floor) break;
+        const template = str(msg.template, 200).trim();
+        const err = building.setBranchTemplate(floor.id, template);
+        if (err) {
+          warn(c, err);
+          break;
+        }
+        toastFloor(floor, template ? `🌿 ${who} set this floor's branch names to ${template}` : `🌿 ${who} set this floor's branch names back to the default`);
+        floorsChanged();
+        break;
+      }
       case 'worker.spawn': {
         const floor = here();
         if (!floor) break;

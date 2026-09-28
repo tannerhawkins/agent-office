@@ -2,15 +2,17 @@ import { existsSync, readFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { WORKTREES_DIR, Worktrees, describeWork, gitError } from './worktrees.js';
+import { BRANCHES_FILE, WORKTREES_DIR, Worktrees, describeWork, gitError } from './worktrees.js';
 
 const HELP = `agent-office prune — remove leftover worker worktrees and branches
 
 Usage:
   agent-office prune [dir] [options]
 
-Removes the worktrees under ${WORKTREES_DIR}/ and the office/* branches that
-no worker of the office in [dir] (default: current directory) uses any more.
+Removes the worktrees under ${WORKTREES_DIR}/ and the branches the office cut
+for its workers (the ones in ${BRANCHES_FILE}, and any office/*) that no
+worker of the office in [dir] (default: current directory) uses any more.
+Branches you made yourself are never touched.
 Anything with uncommitted changes, or with commits that no remote has, is kept
 and listed, so nothing is lost by accident.
 
@@ -138,7 +140,7 @@ export async function prune(argv: string[]): Promise<number> {
       }
     });
   }
-  if (!worktrees.length && !branches.length && !strays.length) console.log(`  nothing under ${WORKTREES_DIR}/ and no office/* branches — all clean`);
+  if (!worktrees.length && !branches.length && !strays.length) console.log(`  nothing under ${WORKTREES_DIR}/ and no branches the office cut — all clean`);
   console.log(`\n  ${removed} ${dryRun ? 'to remove' : 'removed'}, ${kept} kept.\n`);
   return 0;
 }

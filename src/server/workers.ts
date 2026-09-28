@@ -8,6 +8,7 @@ import headless from '@xterm/headless';
 import serialize from '@xterm/addon-serialize';
 import type { AgentProvider, Run, TerminalHit, WorkerInfo, WorkerKind, WorkerStatus, WorkerTask } from '../shared/protocol.js';
 import { FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, RGB_FLAG } from '../shared/protocol.js';
+import { branchName, issueFromPrompt } from '../shared/branches.js';
 import { Worktrees, describeWork, type WorktreeCleanup, type WorktreeState } from './worktrees.js';
 import { DESK_BY_ID, STATION_AGENT } from '../shared/layout.js';
 import { stationBrief } from './stations.js';
@@ -121,6 +122,14 @@ interface Worker {
   fresh?: { readonly line: number };
 }
 
+/** What a worker's branch can be named after, beyond the worker itself. */
+export interface BranchTask {
+  title?: string;
+  issue?: number;
+  /** Who asked for the work. */
+  user?: string;
+}
+
 export interface WorkerEvents {
   update(info: WorkerInfo): void;
   remove(workerId: string): void;
@@ -134,6 +143,8 @@ export class WorkerManager {
   private statePath: string;
   private settingsPath: string;
   private trees: Worktrees;
+  /** The floor's branch template for new worktrees (see shared/branches.ts); undefined is the default. */
+  branchTemplate: () => string | undefined = () => undefined;
   private agentPath: string | null = null;
   readonly defaultProvider: AgentProvider;
   private openCodePlugin: string;
@@ -239,7 +250,12 @@ export class WorkerManager {
     return false;
   }
 
-  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', provider?: AgentProvider, model?: string): WorkerInfo | string {
+  /**
+   * Hires a worker at a desk. `task` says what its branch is named after when it gets a worktree
+   * (see the floor's branch template); without one, a task handed over from the issues board is
+   * recognized in the prompt.
+   */
+  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', provider?: AgentProvider, model?: string, task?: BranchTask): WorkerInfo | string {
     const selectedProvider = kind === 'agent' ? provider ?? this.defaultProvider : undefined;
     const modelError = validateWorkerModel(kind, selectedProvider, model);
     if (modelError) return modelError;
@@ -260,7 +276,15 @@ export class WorkerManager {
     const id = randomBytes(6).toString('hex');
     let wt: WorkerInfo['worktree'];
     if (worktree) {
-      const made = this.trees.create(`${name.toLowerCase()}-${id.slice(0, 4)}`);
+      const handed = task ? undefined : issueFromPrompt(prompt);
+      const branch = branchName(this.branchTemplate(), {
+        user: task?.user ?? by,
+        worker: name,
+        id: id.slice(0, 4),
+        issue: task?.issue ?? handed?.issue,
+        task: task?.title || handed?.title || prompt,
+      });
+      const made = this.trees.create(`${name.toLowerCase()}-${id.slice(0, 4)}`, branch);
       if (typeof made === 'string') return made;
       wt = made;
     }

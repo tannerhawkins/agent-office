@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -11,8 +11,10 @@ const execFileP = promisify(execFile);
 
 /** Where the office keeps its workers' worktrees, relative to the project. */
 export const WORKTREES_DIR = path.join('.agent-office', 'worktrees');
-/** Their branches are office/<worker>-<id>. */
+/** Branches before floors could name them were all office/<worker>-<id>; prune still knows them by that. */
 export const BRANCH_PREFIX = 'office/';
+/** Every branch the office cut for a worker, whatever the floor's template named it, so prune knows its own. */
+export const BRANCHES_FILE = path.join('.agent-office', 'branches.json');
 
 export interface WorktreeRef {
   /** Folder relative to the project dir; missing for a branch whose worktree is already gone. */
@@ -39,16 +41,20 @@ export class Worktrees {
   }
 
   /**
-   * A new branch and worktree at the project's current HEAD. `from` is the branch the project was
-   * on, which the worker's pull request targets. Returns what went wrong as a string.
+   * A new branch and worktree at the project's current HEAD, in .agent-office/worktrees/<folder>.
+   * `wanted` is the branch's name; when a branch by that name is already here or on origin, it gets
+   * -2, -3... `from` is the branch the project was on, which the worker's pull request targets.
+   * Returns what went wrong as a string.
    */
-  create(slug: string): (Required<WorktreeRef> & { from?: string }) | string {
+  create(folder: string, wanted: string): (Required<WorktreeRef> & { from?: string }) | string {
     try {
       const base = this.gitSync(['rev-parse', 'HEAD']);
       const from = this.currentBranch();
-      const rel = path.join(WORKTREES_DIR, slug);
-      const branch = `${BRANCH_PREFIX}${slug}`;
+      const rel = path.join(WORKTREES_DIR, folder);
+      let branch = wanted;
+      for (let n = 2; this.branchTaken(branch); n++) branch = `${wanted}-${n}`;
       this.gitSync(['worktree', 'add', '-b', branch, rel, base]);
+      this.record(branch, true);
       return { path: rel, branch, base, from };
     } catch (err) {
       return `Could not create a git worktree: ${gitError(err)}`;
@@ -98,14 +104,20 @@ export class Worktrees {
       }
       // Forget worktrees whose folders are gone: this one, and any someone rm -rf'd by hand.
       await this.git(['worktree', 'prune']);
-      if (cleanup === 'all') await this.git(['branch', '-D', wt.branch]);
+      if (cleanup === 'all') {
+        await this.git(['branch', '-D', wt.branch]);
+        this.record(wt.branch, false);
+      }
       return undefined;
     } catch (err) {
       return gitError(err);
     }
   }
 
-  /** The worktrees git has under .agent-office/worktrees, every office/* branch, and folders there git doesn't know. */
+  /**
+   * The worktrees git has under .agent-office/worktrees, every branch the office cut (the ones it
+   * recorded, and any office/* from before it kept a record), and folders there git doesn't know.
+   */
   async list(): Promise<{ worktrees: ListedWorktree[]; branches: string[]; strays: string[] }> {
     const home = path.join(this.root, WORKTREES_DIR);
     const worktrees: ListedWorktree[] = [];
@@ -118,7 +130,11 @@ export class Worktrees {
       } else if (cur && line.startsWith('HEAD ')) cur.head = line.slice('HEAD '.length);
       else if (cur && line.startsWith('branch ')) cur.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
     }
-    const branches = (await this.git(['for-each-ref', '--format=%(refname:short)', `refs/heads/${BRANCH_PREFIX}`])).split('\n').filter(Boolean);
+    const all = new Set((await this.git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/'])).split('\n').filter(Boolean));
+    const recorded = this.recorded();
+    const branches = [...all].filter((b) => b.startsWith(BRANCH_PREFIX) || recorded.has(b));
+    // Deleted some other way: forget it, so a branch someone makes by that name later is theirs.
+    for (const b of recorded) if (!all.has(b)) this.record(b, false);
     const known = new Set(worktrees.map((w) => path.join(this.root, w.path)));
     const strays = existsSync(home)
       ? readdirSync(home)
@@ -132,6 +148,41 @@ export class Worktrees {
   /** True for a folder inside .agent-office/worktrees, the only place this class deletes on its own. */
   owns(abs: string): boolean {
     return within(path.join(this.root, WORKTREES_DIR), real(abs));
+  }
+
+  /** A branch by this name is here, or on origin (where the worker's push would land on someone else's). */
+  private branchTaken(branch: string): boolean {
+    for (const ref of [`refs/heads/${branch}`, `refs/remotes/origin/${branch}`]) {
+      try {
+        this.gitSync(['show-ref', '--verify', '--quiet', ref]);
+        return true;
+      } catch {
+        // not that one
+      }
+    }
+    return false;
+  }
+
+  /** The branches the office cut, as branches.json has them. */
+  recorded(): Set<string> {
+    try {
+      const saved = JSON.parse(readFileSync(path.join(this.dir, BRANCHES_FILE), 'utf8')) as unknown;
+      return new Set(Array.isArray(saved) ? saved.filter((b): b is string => typeof b === 'string') : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  private record(branch: string, made: boolean) {
+    const set = this.recorded();
+    if (made === set.has(branch)) return;
+    if (made) set.add(branch);
+    else set.delete(branch);
+    try {
+      writeFileSync(path.join(this.dir, BRANCHES_FILE), JSON.stringify([...set].sort(), null, 2), { mode: 0o600 });
+    } catch (err) {
+      console.error(`agent-office: couldn't save the office's branches: ${(err as Error).message}`);
+    }
   }
 
   private gitSync(args: string[], cwd = this.dir): string {
