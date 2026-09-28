@@ -102,6 +102,8 @@ interface Worker {
   cursorTurns: string[];
   /** Cursor's approval prompt is on screen: it's waiting on a human (Cursor has no hook for that). */
   cursorApproval?: boolean;
+  /** A new worktree's setup (see Worktrees.setupScript), run in its terminal before its first start. */
+  setup?: string;
   /** Its latest tool, to say what an approval prompt is about. */
   lastTool?: string;
   /** Its latest prompts and tool calls, for naming its task. */
@@ -308,6 +310,7 @@ export class WorkerManager {
       activity: prompt ? truncate(prompt, 80) : undefined,
     };
     const w = newWorker(info, newTracker());
+    if (wt) w.setup = this.trees.setupScript(wt.path);
     this.workers.set(id, w);
     if (info.prompt) this.notePrompt(w, info.prompt);
     // A board agent is told what it's there for ahead of its first request (which is what shows).
@@ -961,15 +964,22 @@ export class WorkerManager {
         env.AGENT_OFFICE_SESSION_ID = resumeSessionId ?? '';
         env.OPENCODE_CONFIG_CONTENT = mergeOpenCodeConfigContent(env.OPENCODE_CONFIG_CONTENT, openCodePluginSpecifier(this.openCodePlugin));
       }
+      let run: { file: string; args: string[] };
       if (isShell) {
-        proc = this.host.spawn({ file: shell, args, ...where });
+        run = { file: shell, args };
       } else if (commandPath) {
-        proc = this.host.spawn({ file: commandPath, args, ...where });
+        run = { file: commandPath, args };
       } else {
         // Not found on PATH: let a login shell find it (nvm, asdf, ~/.local/bin ...).
         const line = ['exec', command, ...args].map((a, i) => (i < 2 ? a : shq(a))).join(' ');
-        proc = this.host.spawn({ file: shell, args: ['-l', '-i', '-c', line], ...where });
+        run = { file: shell, args: ['-l', '-i', '-c', line] };
       }
+      if (w.setup) {
+        // The worktree's setup goes first, in the same terminal so its output shows, then the worker.
+        run = { file: shell, args: ['-l', '-c', `${w.setup}\nexec "$0" "$@"`, run.file, ...run.args] };
+        w.setup = undefined;
+      }
+      proc = this.host.spawn({ ...run, ...where });
     } catch (err) {
       this.startFailed(w, (err as Error).message);
       return;

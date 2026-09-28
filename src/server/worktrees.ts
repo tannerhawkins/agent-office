@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -15,6 +15,10 @@ export const WORKTREES_DIR = path.join('.agent-office', 'worktrees');
 export const BRANCH_PREFIX = 'office/';
 /** Every branch the office cut for a worker, whatever the floor's template named it, so prune knows its own. */
 export const BRANCHES_FILE = path.join('.agent-office', 'branches.json');
+/** Gitignored files a new worktree should get a copy of (.env and such), in .gitignore syntax, as Claude Code reads it. */
+export const INCLUDE_FILE = '.worktreeinclude';
+/** Cursor's setup commands for a new worktree (see worktreeSetup). */
+export const CURSOR_WORKTREES_FILE = path.join('.cursor', 'worktrees.json');
 
 export interface WorktreeRef {
   /** Folder relative to the project dir; missing for a branch whose worktree is already gone. */
@@ -55,10 +59,70 @@ export class Worktrees {
       for (let n = 2; this.branchTaken(branch); n++) branch = `${wanted}-${n}`;
       this.gitSync(['worktree', 'add', '-b', branch, rel, base]);
       this.record(branch, true);
+      this.copyIncluded(path.join(this.dir, rel));
       return { path: rel, branch, base, from };
     } catch (err) {
       return `Could not create a git worktree: ${gitError(err)}`;
     }
+  }
+
+  /**
+   * Copies the files .worktreeinclude names into a new worktree. Only gitignored ones: a tracked file
+   * is already there. Git checks out tracked files only, so without this a worker has no .env.
+   */
+  copyIncluded(abs: string) {
+    const include = path.join(this.dir, INCLUDE_FILE);
+    if (!existsSync(include)) return;
+    try {
+      const matched = this.gitSync(['ls-files', '-z', '--others', '--ignored', `--exclude-from=${include}`]).split('\0').filter((f) => f && !f.startsWith('.agent-office/'));
+      if (!matched.length) return;
+      const ignored = checkIgnored(this.dir, matched);
+      for (const f of matched) {
+        if (!ignored.has(f)) continue;
+        const to = path.join(abs, f);
+        if (existsSync(to)) continue;
+        mkdirSync(path.dirname(to), { recursive: true });
+        cpSync(path.join(this.dir, f), to, { verbatimSymlinks: true });
+      }
+    } catch (err) {
+      console.error(`agent-office: couldn't copy ${INCLUDE_FILE} files into ${abs}: ${gitError(err)}`);
+    }
+  }
+
+  /**
+   * The shell lines that set up a new worktree, from Cursor's .cursor/worktrees.json (the worktree's
+   * own, else the project's): `setup-worktree-unix`, or else `setup-worktree`, each a list of commands
+   * or the path of a script beside the file. Cursor only runs them for worktrees it makes itself, and
+   * the office makes its own. They run in the worktree with ROOT_WORKTREE_PATH set to the project, as
+   * in Cursor. Undefined when there's nothing to run.
+   */
+  setupScript(rel: string): string | undefined {
+    const abs = path.join(this.dir, rel);
+    const file = [abs, this.dir].map((d) => path.join(d, CURSOR_WORKTREES_FILE)).find((f) => existsSync(f));
+    if (!file) return undefined;
+    let config: Record<string, unknown>;
+    try {
+      config = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    } catch (err) {
+      return `printf '%s\\n' ${shq(`agent-office: skipped worktree setup, ${CURSOR_WORKTREES_FILE} isn't valid JSON: ${(err as Error).message}`)}`;
+    }
+    const setup = config['setup-worktree-unix'] ?? config['setup-worktree'];
+    let lines: string[];
+    if (typeof setup === 'string' && setup.trim()) {
+      const script = path.resolve(path.dirname(file), setup.trim());
+      lines = [`if [ -x ${shq(script)} ]; then ${shq(script)}; else sh ${shq(script)}; fi`];
+    } else if (Array.isArray(setup)) {
+      lines = setup.filter((c): c is string => typeof c === 'string' && !!c.trim());
+    } else return undefined;
+    if (!lines.length) return undefined;
+    return [
+      `export ROOT_WORKTREE_PATH=${shq(this.dir)}`,
+      `printf '%s\\n' ${shq(`agent-office: setting up this worktree (${CURSOR_WORKTREES_FILE})`)}`,
+      '(',
+      'set -e',
+      ...lines,
+      `) || printf '%s\\n' "agent-office: worktree setup failed (exit $?), starting anyway"`,
+    ].join('\n');
   }
 
   /** The branch the project is on, or undefined when HEAD is detached. */
@@ -208,6 +272,22 @@ export function describeWork(s: WorktreeState): string {
 export function gitError(err: unknown): string {
   const e = err as { stderr?: string; message?: string };
   return String(e.stderr || e.message || err).trim().split('\n').filter(Boolean).pop() ?? 'git failed';
+}
+
+/** Which of these paths git ignores. */
+function checkIgnored(cwd: string, files: string[]): Set<string> {
+  try {
+    const out = execFileSync('git', ['check-ignore', '-z', '--stdin'], { cwd, input: files.join('\0'), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 20_000 });
+    return new Set(out.split('\0').filter(Boolean));
+  } catch (err) {
+    // Exit 1: none of them are.
+    if ((err as { status?: number }).status === 1) return new Set();
+    throw err;
+  }
+}
+
+function shq(s: string): string {
+  return `'${s.replaceAll("'", "'\"'\"'")}'`;
 }
 
 function real(p: string): string {
