@@ -810,6 +810,7 @@ export async function startServer(cfg: Config) {
       floor.workers.wakeAll();
     }
     limits.refresh();
+    cursorLimits.refresh();
 
     ws.on('message', (raw) => {
       let msg: ClientMsg;
