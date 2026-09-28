@@ -396,15 +396,58 @@ test('OpenCode keeps configured model flags when no explicit model is selected, 
   assert.ok(resumed.args.includes('--keep'));
 });
 
-test('workers reject models for non-OpenCode providers and malformed model ids', (t) => {
+test('workers reject models for providers that cannot pick one and malformed model ids', (t) => {
   const f = fixture();
   t.after(() => f.close());
-  const workers = manager(f, f.claude, []);
+  const workers = manager(f, f.custom, []);
   t.after(() => workers.shutdown());
-  assert.match(workers.spawn('desk-1', 'test', 'bad', false, 'agent', 'claude', 'openai/gpt-5') as string, /model|OpenCode/i);
+  assert.match(workers.spawn('desk-1', 'test', 'bad', false, 'agent', 'custom', 'some-model') as string, /cannot pick a model/i);
   assert.match(workers.spawn('desk-2', 'test', 'bad', false, 'agent', 'opencode', 'gpt-5') as string, /model|format|provider/i);
   assert.match(workers.spawn('desk-3', 'test', 'bad', false, 'agent', 'opencode', 'openai/gpt 5') as string, /model|format|whitespace/i);
   assert.match(workers.spawn('desk-4', 'test', 'bad', false, 'shell', undefined, 'openai/gpt-5') as string, /shell|model/i);
+  assert.match(workers.spawn('desk-5', 'test', 'bad', false, 'agent', 'claude', '--dangerously-skip-permissions') as string, /model|"-"/i);
+});
+
+test('Claude, Cursor and Codex workers start on their picked model, keep it on resume, and replace --agent-args models', async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const previousExit = process.env.FAKE_AGENT_EXIT_MS;
+  const previousLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_EXIT_MS = '180';
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (previousExit === undefined) delete process.env.FAKE_AGENT_EXIT_MS;
+    else process.env.FAKE_AGENT_EXIT_MS = previousExit;
+    if (previousLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = previousLog;
+    f.close();
+  });
+  writeFileSync(path.join(path.dirname(f.claude), 'cursor-agent'), fakeAgent, { mode: 0o700 });
+  const workers = manager(f, f.claude, [], ['--model', 'opus', '--keep', '--model=sonnet']);
+  t.after(() => workers.shutdown());
+
+  const claude = workers.spawn('desk-1', 'test', 'claude prompt', false, 'agent', 'claude', 'haiku');
+  assert.notEqual(typeof claude, 'string'); if (typeof claude === 'string') return;
+  const isClaudeWorker = (r: Invocation) => r.kind === 'claude' && r.args.includes('--settings');
+  const first = (await waitFor(f.read, (x) => x.some(isClaudeWorker))).find(isClaudeWorker)!;
+  assert.deepEqual(first.args.slice(2), ['--keep', '--model', 'haiku', '--', 'claude prompt']);
+  assert.equal(workers.handleHook(claude.id, first.env.hookToken!, 'SessionStart', { session_id: 'claude-model' }), true);
+  await waitFor(() => workers.get(claude.id)?.status, (status) => status === 'exited');
+  assert.equal(workers.resume(claude.id), undefined);
+  const resumed = (await waitFor(f.read, (x) => x.filter(isClaudeWorker).length >= 2)).filter(isClaudeWorker)[1];
+  assert.deepEqual(resumed.args.slice(2), ['--keep', '--model', 'haiku', '--resume', 'claude-model']);
+
+  // Cursor and Codex aren't the configured agent, so they only get the office's arguments and the model.
+  const cursor = workers.spawn('desk-2', 'test', 'cursor prompt', false, 'agent', 'cursor', 'gpt-5[reasoning=high]');
+  assert.notEqual(typeof cursor, 'string');
+  const cursorCall = (await waitFor(f.read, (x) => x.some((r) => r.kind === 'cursor-agent'))).find((r) => r.kind === 'cursor-agent')!;
+  assert.deepEqual(cursorCall.args.slice(3), ['--model', 'gpt-5[reasoning=high]', '--', 'cursor prompt']);
+
+  const codex = workers.spawn('desk-3', 'test', 'codex prompt', false, 'agent', 'codex', 'gpt-5-codex');
+  assert.notEqual(typeof codex, 'string');
+  const codexCall = (await waitFor(f.read, (x) => x.some((r) => r.kind === 'codex'))).find((r) => r.kind === 'codex')!;
+  assert.deepEqual(codexCall.args.slice(0, 2), ['--model', 'gpt-5-codex']);
+  assert.deepEqual(codexCall.args.slice(-2), ['--', 'codex prompt']);
 });
 
 test('provider and hook boundaries reject invalid combinations', async (t) => {

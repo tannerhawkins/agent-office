@@ -149,7 +149,7 @@ agent-office accounts [list | invite [name] [--admin] | revoke <name> | role <na
 
 Select **Claude Code**, **OpenCode**, **Codex** or **Cursor** when hiring a worker, handing off a board item, or adding a queue task. Existing workers keep their provider when prompted or resumed, and queued tasks keep their choice when retried or restored after a restart.
 
-For OpenCode, the optional **OpenCode model** field selects the initial model for a new worker or queue task. Suggestions come from `opencode models`; you can also enter a `provider/model` ID. Leave it empty to use your OpenCode settings (including configured CLI arguments). An explicit choice overrides configured model arguments for that launch and stays with a queued task when retried.
+Claude Code, OpenCode, Codex and Cursor workers and queue tasks can each be given a model: the optional **model** field under the provider picks one for that worker or task alone. Suggestions come from `opencode models` and `cursor-agent models` (cached for a minute); Claude gets its aliases (`opus`, `sonnet`, `haiku`, `fable`), and Codex takes whatever ID you type. OpenCode IDs are `provider/model`; Cursor's parameterized models keep their brackets (`claude-opus-4-8[effort=high]`). Leave it empty to use the provider's own settings (including configured CLI arguments). A choice replaces any model in `--agent-args` for that worker, stays with a queued task when it is retried or the office restarts, and shows next to the worker's provider. Claude, Codex and Cursor workers get it again every time they resume, so a restart doesn't put them back on the default model; OpenCode sessions restore their own model, so it only gets one on the first launch.
 
 In an open OpenCode terminal, **Models** opens the native model picker using the default `Ctrl+X M` shortcut. Select a model there to change the active worker without restarting it or losing a draft. If you customized that binding, use your configured shortcut or `/models` inside the terminal. Resuming a saved session lets OpenCode restore its current model instead of forcing the initial Office selection again.
 
@@ -159,7 +159,7 @@ Claude Code remains the default. To default to OpenCode:
 agent-office /path/to/project --agent opencode
 ```
 
-`--agent-args` applies only to the provider configured by `--agent`; choosing another provider uses its normal command and settings. OpenCode model flags therefore never reach Claude Code, and vice versa. An arbitrary `--agent` executable remains available as **Custom**.
+`--agent-args` applies only to the provider configured by `--agent`; choosing another provider uses its normal command and settings. Model flags there therefore never reach another provider. An arbitrary `--agent` executable remains available as **Custom**.
 
 OpenCode receives prompts through `--prompt` and resumes its saved session through `--session`. The office adds a local event plugin through `OPENCODE_CONFIG_CONTENT`, preserving existing inline JSON settings and plugin entries. Inline settings must be a JSON object; configuration files continue to use OpenCode's own loader. The office does not edit your OpenCode configuration files or bypass permission prompts. The bridge reports worker status to a loopback endpoint authenticated by a per-worker token. OpenCode, Codex and Cursor must be installed separately on machines provisioned with the existing AWS script, which still installs Claude Code only.
 

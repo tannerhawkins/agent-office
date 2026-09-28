@@ -94,12 +94,29 @@ test('queue preserves the selected OpenCode model through seating, retry, and re
   assert.equal(f.workers[2].model, 'anthropic/claude-sonnet-4');
 });
 
-test('queue rejects models unless they are valid OpenCode model ids', (t) => {
+test('queue keeps a model for every provider that takes one, through a restart, and rejects unsafe ids', (t) => {
   const f = fixture(); t.after(() => f.close());
   const q = f.open();
-  assert.match(q.add('Task', 'Tester', undefined, undefined, 'claude', 'openai/gpt-5') ?? '', /model|OpenCode/i);
+  assert.match(q.add('Task', 'Tester', undefined, undefined, 'claude', '--dangerously-skip-permissions') ?? '', /model|"-"/i);
+  assert.match(q.add('Task', 'Tester', undefined, undefined, 'cursor', 'gpt 5') ?? '', /model|whitespace/i);
   assert.match(q.add('Task', 'Tester', undefined, undefined, 'opencode', 'gpt-5') ?? '', /model|format|provider/i);
   assert.match(q.add('Task', 'Tester', undefined, undefined, 'opencode', 'openai/gpt 5') ?? '', /model|format|whitespace/i);
+  assert.equal(q.state().tasks.length, 0);
+
+  q.setLimit(0);
+  assert.equal(q.add('Claude task', 'Tester', undefined, undefined, 'claude', 'haiku'), undefined);
+  assert.equal(q.add('Cursor task', 'Tester', undefined, undefined, 'cursor', 'gpt-5[reasoning=high]'), undefined);
+  assert.equal(q.add('Codex task', 'Tester', undefined, undefined, 'codex', 'gpt-5-codex'), undefined);
+  q.shutdown();
+  const restored = f.open();
+  restored.setLimit(3);
+  assert.deepEqual(f.workers.map((w) => [w.provider, w.model]), [['claude', 'haiku'], ['cursor', 'gpt-5[reasoning=high]'], ['codex', 'gpt-5-codex']]);
+});
+
+test('queue rejects a model for a provider that cannot pick one', (t) => {
+  const f = fixture('custom'); t.after(() => f.close());
+  const q = f.open();
+  assert.match(q.add('Task', 'Tester', undefined, undefined, 'custom', 'anything') ?? '', /cannot pick a model/i);
   assert.equal(q.state().tasks.length, 0);
 });
 

@@ -34,7 +34,7 @@ export interface WorkerInfo {
   /** 'agent' runs the selected provider; 'shell' is a plain shared login shell. */
   kind: WorkerKind;
   provider?: AgentProvider;
-  /** Initial OpenCode model selected for this worker, when one was requested. */
+  /** The model picked for this worker, when one was; unset runs the provider's default. */
   model?: string;
   deskId: string;
   name: string;
@@ -224,7 +224,7 @@ export type TaskStatus = 'queued' | 'running' | 'done';
 export interface QueueTask {
   id: string;
   provider?: AgentProvider;
-  /** Initial OpenCode model selected for this task, when one was requested. */
+  /** The model picked for this task's worker, when one was; unset runs the provider's default. */
   model?: string;
   /** The GitHub issue it came from, when it did. */
   issue?: number;

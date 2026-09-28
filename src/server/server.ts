@@ -11,8 +11,8 @@ import type { Config } from './config.js';
 import { Auth, type Session } from './auth.js';
 import { Accounts } from './accounts.js';
 import { childEnv, resolveCommand } from './workers.js';
-import { configuredProvider, OPEN_CODE_MODEL_MAX } from './agents.js';
-import { createOpenCodeModelCatalogue } from './models.js';
+import { configuredProvider, MODEL_FLAGS, MODEL_MAX, MODEL_SUGGESTIONS } from './agents.js';
+import { createCursorModelCatalogue, createOpenCodeModelCatalogue, type ModelCatalogue } from './models.js';
 import { Team } from './team.js';
 import { Upgrader } from './upgrade.js';
 import { Services } from './services.js';
@@ -26,7 +26,7 @@ import { Floor, type FloorContext } from './floor.js';
 import { Sky } from './sky.js';
 import { RELAY_LOGIN, relayRequest, relayUpgrade, signInPage, stoppedPage, tunneledPort } from './relay.js';
 import { ChatLog } from './history.js';
-import type { ChatLine, ClientMsg, FloorInfo, FloorView, Me, PeerInfo, SearchResults, ServerMsg, ServicesState } from '../shared/protocol.js';
+import type { AgentProvider, ChatLine, ClientMsg, FloorInfo, FloorView, Me, PeerInfo, SearchResults, ServerMsg, ServicesState } from '../shared/protocol.js';
 import { GH_COMMENT_MAX, isAgentProvider } from '../shared/protocol.js';
 import { DESK_BY_ID, elevatorSpot, seatAt } from '../shared/layout.js';
 import { JUKEBOX_TUNES, STREAM } from '../shared/jukebox.js';
@@ -167,6 +167,10 @@ export async function startServer(cfg: Config) {
     modelCommand.includes('/') ? path.resolve(modelCommand) : modelCommand,
     cfg.dir,
   );
+  const cursorCommand = configuredProvider(cfg.agentCmd) === 'cursor' ? cfg.agentCmd : 'cursor-agent';
+  const cursorModels = createCursorModelCatalogue(resolveCommand(cursorCommand) ?? cursorCommand, cfg.dir);
+  /** Where the task and worker pickers get model suggestions: the CLI's own list, or the office's. */
+  const modelCatalogues: Partial<Record<AgentProvider, ModelCatalogue>> = { opencode: openCodeModels, cursor: cursorModels };
 
   const sendTo = (c: Client, msg: ServerMsg) => {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
@@ -605,11 +609,16 @@ export async function startServer(cfg: Config) {
         return;
       }
       if (p === '/api/whoami') return send(res, 200, { ok: true, me: meOf(session.account?.id) });
-      if (p === '/api/agents/opencode/models' && req.method === 'GET') {
+      const modelsFor = /^\/api\/agents\/([a-z]+)\/models$/.exec(p);
+      if (modelsFor && req.method === 'GET') {
+        const provider = modelsFor[1];
+        if (!isAgentProvider(provider) || !MODEL_FLAGS[provider]) return send(res, 404, { error: 'That provider cannot pick a model' });
+        const catalogue = modelCatalogues[provider];
+        if (!catalogue) return send(res, 200, { models: MODEL_SUGGESTIONS[provider] ?? [] });
         try {
-          return send(res, 200, { models: await openCodeModels.get() });
+          return send(res, 200, { models: await catalogue.get() });
         } catch {
-          return send(res, 502, { error: 'Could not load OpenCode models' });
+          return send(res, 502, { error: 'Could not load models' });
         }
       }
       if (p === '/api/image' && req.method === 'GET') {
@@ -1012,7 +1021,7 @@ export async function startServer(cfg: Config) {
           warn(c, 'Unknown agent provider');
           break;
         }
-        const model = msg.model === undefined ? undefined : str(msg.model, OPEN_CODE_MODEL_MAX + 1);
+        const model = msg.model === undefined ? undefined : str(msg.model, MODEL_MAX + 1);
         const r = floor.workers.spawn(str(msg.deskId, 32), who, str(msg.prompt, 20000) || undefined, msg.worktree === true, kind, msg.provider, model);
         if (typeof r === 'string') warn(c, r);
         else toastFloor(floor, kind === 'shell' ? `${who} opened a shell at a desk` : `${who} hired ${r.name}${r.prompt ? ' with a task' : ''}`);
@@ -1162,7 +1171,7 @@ export async function startServer(cfg: Config) {
           break;
         }
         const issue = Number.isInteger(msg.issue) && (msg.issue as number) > 0 ? (msg.issue as number) : undefined;
-        const model = msg.model === undefined ? undefined : str(msg.model, OPEN_CODE_MODEL_MAX + 1);
+        const model = msg.model === undefined ? undefined : str(msg.model, MODEL_MAX + 1);
         const err = floor.queue.add(str(msg.prompt, 20000), who, str(msg.title, 200), issue, msg.provider, model);
         if (err) warn(c, err);
         else toastFloor(floor, `📋 ${who} queued ${issue !== undefined ? `issue #${issue}` : 'a task'}`);

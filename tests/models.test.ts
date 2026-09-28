@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isValidOpenCodeModel } from '../src/server/agents.js';
-import { createOpenCodeModelCatalogue, fetchOpenCodeModels, type ModelCommandRunner } from '../src/server/models.js';
+import { isValidModel, isValidOpenCodeModel, withoutModelFlag } from '../src/server/agents.js';
+import { createOpenCodeModelCatalogue, fetchCursorModels, fetchOpenCodeModels, type ModelCommandRunner } from '../src/server/models.js';
 
 test('OpenCode model ids require provider/model and reject whitespace or control characters', () => {
   assert.equal(isValidOpenCodeModel('openai/gpt-5'), true);
@@ -55,4 +55,39 @@ test('OpenCode catalogue errors do not expose command output', async () => {
   await assert.rejects(createOpenCodeModelCatalogue('opencode', '/project', runner).get(), (error: unknown) => {
     return error instanceof Error && /unavailable/i.test(error.message) && !error.message.includes('secret-token');
   });
+});
+
+test('model ids for other providers are argv-safe and keep Cursor parameter brackets', () => {
+  assert.equal(isValidModel('claude', 'opus'), true);
+  assert.equal(isValidModel('claude', 'claude-opus-5-5'), true);
+  assert.equal(isValidModel('cursor', "claude-opus-4-8[context=1m,effort=high]"), true);
+  assert.equal(isValidModel('codex', 'gpt-5-codex'), true);
+  assert.equal(isValidModel('claude', '--dangerously-skip-permissions'), false);
+  assert.equal(isValidModel('cursor', 'gpt 5'), false);
+  assert.equal(isValidModel('codex', ''), false);
+  assert.equal(isValidModel('custom', 'anything'), false);
+  assert.equal(isValidModel(undefined, 'opus'), false);
+  assert.equal(isValidModel('opencode', 'gpt-5'), false);
+});
+
+test('model flags from --agent-args are removed in every form the provider understands', () => {
+  const args = ['--model', 'a', '--keep', '--model=b', '-m', 'c', '-md', '--mode', 'plan'];
+  assert.deepEqual(withoutModelFlag('codex', args), ['--keep', '--mode', 'plan']);
+  // Claude and Cursor have no -m, so it isn't theirs to remove.
+  assert.deepEqual(withoutModelFlag('cursor', args), ['--keep', '-m', 'c', '-md', '--mode', 'plan']);
+  assert.deepEqual(withoutModelFlag('custom', args), args);
+});
+
+test('Cursor catalogue reads the ids from `cursor-agent models` and skips the header and tip', async () => {
+  let call: { file: string; args: string[] } | undefined;
+  const runner: ModelCommandRunner = async (file, args) => {
+    call = { file, args };
+    return {
+      stdout: '\x1b[1mAvailable models\x1b[0m\n\nauto - Auto (default)\ngpt-5.3-codex - Codex 5.3\nauto - Auto (default)\n\nTip: use --model <id> (or /model <id> in interactive mode) to switch.\n',
+      stderr: '',
+    };
+  };
+  assert.deepEqual(await fetchCursorModels('/bin/cursor-agent', '/project', runner), ['auto', 'gpt-5.3-codex']);
+  assert.deepEqual(call, { file: '/bin/cursor-agent', args: ['models'] });
+  await assert.rejects(fetchCursorModels('cursor-agent', '/project', async () => { throw new Error('secret'); }), /Cursor model catalogue unavailable/);
 });

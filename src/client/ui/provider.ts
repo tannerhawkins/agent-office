@@ -70,39 +70,51 @@ function preferredProvider(options: AgentProvider[], fallback: AgentProvider): A
 export interface ProviderPicker {
   element: HTMLElement;
   value(): AgentProvider;
-  /** The optional initial OpenCode model override. Empty or invalid input is omitted. */
+  /** The optional model override for the selected provider. Empty or invalid input is omitted. */
   model(): string | undefined;
-  /** Reports a visible field error for an invalid nonempty OpenCode model. */
+  /** Reports a visible field error for an invalid nonempty model. */
   valid(): boolean;
 }
 
 const MODEL_MAX = 256;
-let modelList: string[] | null = null;
-let modelListAt = 0;
-let modelRequest: Promise<string[]> | null = null;
+/** Providers whose CLI takes a model; the server's agents.ts MODEL_FLAGS. */
+const MODEL_PROVIDERS: AgentProvider[] = ['claude', 'opencode', 'codex', 'cursor'];
+const MODEL_EXAMPLE: Partial<Record<AgentProvider, string>> = {
+  claude: 'e.g. opus or sonnet',
+  opencode: 'provider/model',
+  codex: 'e.g. gpt-5-codex',
+  cursor: 'e.g. auto',
+};
+const modelLists = new Map<AgentProvider, { models: string[]; at: number }>();
+const modelRequests = new Map<AgentProvider, Promise<string[]>>();
 
-function validModel(value: string): boolean {
+/** Mirrors the server's isValidModel: argv-safe ids, and OpenCode's are provider/model. */
+function validModel(provider: AgentProvider, value: string): boolean {
   if (value.length === 0 || value.length > MODEL_MAX || /[\s\p{Cc}\p{Cf}]/u.test(value)) return false;
+  if (provider !== 'opencode') return !value.startsWith('-');
   const parts = value.split('/');
   return parts.length >= 2 && /^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/.test(parts[0]) && parts.slice(1).every((part) => part.length > 0);
 }
 
-function fetchOpenCodeModels(): Promise<string[]> {
-  if (modelList && Date.now() - modelListAt < 60_000) return Promise.resolve(modelList);
-  if (modelRequest) return modelRequest;
-  modelRequest = fetch('/api/agents/opencode/models', { credentials: 'same-origin', cache: 'no-store' })
+function fetchModels(provider: AgentProvider): Promise<string[]> {
+  const cached = modelLists.get(provider);
+  if (cached && Date.now() - cached.at < 60_000) return Promise.resolve(cached.models);
+  const pending = modelRequests.get(provider);
+  if (pending) return pending;
+  const request = fetch(`/api/agents/${provider}/models`, { credentials: 'same-origin', cache: 'no-store' })
     .then(async (res) => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { models?: unknown };
-      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validModel(m)) : [];
-      modelList = [...new Set(models)];
-      modelListAt = Date.now();
-      return modelList;
+      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validModel(provider, m)) : [];
+      const list = [...new Set(models)];
+      modelLists.set(provider, { models: list, at: Date.now() });
+      return list;
     })
     .finally(() => {
-      modelRequest = null;
+      modelRequests.delete(provider);
     });
-  return modelRequest;
+  modelRequests.set(provider, request);
+  return request;
 }
 
 /** A provider selector that never offers a provider outside the server's metadata. */
@@ -117,34 +129,44 @@ export function providerPicker(project: ProjectInfo | null, id: string, label = 
     type: 'text',
     id: `${id}-model`,
     list: `${id}-models`,
-    placeholder: 'Default (OpenCode settings)',
-    'aria-label': 'OpenCode model',
     autocomplete: 'off',
     maxlength: MODEL_MAX,
   }) as HTMLInputElement;
-  const modelHint = h('small.provider-model-hint', {}, 'Optional provider/model override; suggestions load when OpenCode is selected.');
+  const modelHint = h('small.provider-model-hint');
   const modelListEl = h('datalist', { id: `${id}-models` });
-  const modelChoice = h('div.provider-model', {}, h('label', { for: `${id}-model` }, 'OpenCode model'), modelInput, modelListEl, modelHint);
-  const setModelVisibility = (provider: AgentProvider) => {
-    const openCode = provider === 'opencode';
-    modelChoice.classList.toggle('hidden', !openCode);
-    modelInput.disabled = !openCode;
-    if (!openCode) return;
-    modelHint.textContent = modelList ? 'Optional provider/model override; choose a suggestion or enter one manually.' : 'Loading OpenCode models… You can enter a provider/model manually.';
-    void fetchOpenCodeModels()
+  const modelLabel = h('label', { for: `${id}-model` });
+  const modelChoice = h('div.provider-model', {}, modelLabel, modelInput, modelListEl, modelHint);
+  const selected = () => select.value as AgentProvider;
+  const setModelChoice = (provider: AgentProvider) => {
+    const picks = MODEL_PROVIDERS.includes(provider);
+    modelChoice.classList.toggle('hidden', !picks);
+    modelInput.disabled = !picks;
+    // A model belongs to one provider, so switching starts the choice over.
+    modelInput.value = '';
+    modelInput.setCustomValidity('');
+    modelListEl.replaceChildren();
+    if (!picks) return;
+    const name = PROVIDER_LABEL[provider];
+    modelLabel.textContent = `${name} model`;
+    modelInput.placeholder = `Default (${name} settings)`;
+    modelInput.setAttribute('aria-label', `${name} model`);
+    const manual = `Optional; type a model id (${MODEL_EXAMPLE[provider]}).`;
+    modelHint.textContent = modelLists.has(provider) ? manual : `Loading ${name} models… ${manual}`;
+    void fetchModels(provider)
       .then((models) => {
+        if (selected() !== provider) return;
         modelListEl.replaceChildren(...models.map((model) => h('option', { value: model })));
-        modelHint.textContent = 'Optional provider/model override; choose a suggestion or enter one manually.';
+        modelHint.textContent = models.length ? 'Optional; choose a suggestion or type a model id.' : manual;
       })
       .catch(() => {
-        modelHint.textContent = 'Model suggestions unavailable; enter a provider/model manually if needed.';
+        if (selected() === provider) modelHint.textContent = `Model suggestions unavailable. ${manual}`;
       });
   };
-  setModelVisibility(select.value as AgentProvider);
+  setModelChoice(selected());
   select.addEventListener('change', () => {
-    const provider = select.value as AgentProvider;
+    const provider = selected();
     note.textContent = providerUsageNote(provider);
-    setModelVisibility(provider);
+    setModelChoice(provider);
     if (options.includes(provider)) {
       try {
         localStorage.setItem(PROVIDER_KEY, provider);
@@ -156,19 +178,20 @@ export function providerPicker(project: ProjectInfo | null, id: string, label = 
   modelInput.addEventListener('input', () => modelInput.setCustomValidity(''));
   return {
     element: h('div.provider-choice', {}, h('label', { for: id }, label), select, note, modelChoice),
-    value: () => (options.includes(select.value as AgentProvider) ? (select.value as AgentProvider) : fallback),
+    value: () => (options.includes(selected()) ? selected() : fallback),
     model: () => {
-      if (select.value !== 'opencode') return undefined;
-      const value = modelInput.value;
-      return validModel(value) ? value : undefined;
+      const value = modelInput.value.trim();
+      return MODEL_PROVIDERS.includes(selected()) && validModel(selected(), value) ? value : undefined;
     },
     valid: () => {
-      if (select.value !== 'opencode' || !modelInput.value) {
+      const value = modelInput.value.trim();
+      if (!MODEL_PROVIDERS.includes(selected()) || !value) {
         modelInput.setCustomValidity('');
         return true;
       }
-      const okay = validModel(modelInput.value);
-      modelInput.setCustomValidity(okay ? '' : 'Use provider/model format without whitespace or control characters (up to 256 characters).');
+      const okay = validModel(selected(), value);
+      const format = selected() === 'opencode' ? 'Use provider/model format without whitespace or control characters' : 'Use a model id without whitespace or control characters that does not start with "-"';
+      modelInput.setCustomValidity(okay ? '' : `${format} (up to 256 characters).`);
       if (!okay) modelInput.reportValidity();
       return okay;
     },

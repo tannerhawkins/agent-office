@@ -20,7 +20,7 @@ import { addUsage, newTracker, restoreTracker, scanTracker, trackerUsage, zeroUs
 import { PtyHost, SCROLLBACK, type Adopted, type Pty } from './ptys.js';
 import { codexHookArgs, normalizeCodexHook, writeCodexHook } from './codex.js';
 import { reportedUsage } from './reported-usage.js';
-import { configuredProvider, isValidOpenCodeModel, providerCommand, validateWorkerModel } from './agents.js';
+import { configuredProvider, isValidModel, MODEL_FLAGS, providerCommand, validateWorkerModel, withoutModelFlag } from './agents.js';
 import { CURSOR_APPROVAL, CURSOR_LOGGED_OUT, CURSOR_READY, CURSOR_SETUP, CURSOR_TITLE, cursorArgs, normalizeCursorHook, writeCursorPlugin } from './cursor.js';
 import { mergeOpenCodeConfigContent, openCodePluginSpecifier, writeOpenCodePlugin, type OpenCodeStatusEvent } from './opencode.js';
 import { ScrollbackStore, searchTerminal, terminalTail } from './history.js';
@@ -294,7 +294,7 @@ export class WorkerManager {
       id,
       kind,
       provider: selectedProvider,
-      model: selectedProvider === 'opencode' ? model : undefined,
+      model: isValidModel(selectedProvider, model) ? model : undefined,
       deskId,
       name: kind === 'shell' ? `${name} 🐚` : name,
       color: kind === 'shell' ? '#8d99ae' : agent ? agent.color : COLORS[Math.floor(Math.random() * COLORS.length)],
@@ -917,13 +917,17 @@ export class WorkerManager {
     const command = this.command(info);
     const commandPath = isShell ? undefined : configured ? this.agentPath : resolveCommand(command);
     let args = isShell ? ['-l'] : configured ? [...this.agentArgs] : [];
+    // The worker's model replaces any in --agent-args, and goes in again on a resume so it stays
+    // on that model. OpenCode's session remembers its own, so it only gets one on the first launch.
+    const modelFlag = !isShell && provider ? MODEL_FLAGS[provider] : undefined;
+    if (modelFlag && info.model && !isOpenCode) args = [...withoutModelFlag(provider!, args), modelFlag.long, info.model];
     if (isClaude) {
       args.unshift('--settings', this.settingsPath);
       if (resumeSessionId) args.push('--resume', resumeSessionId);
       // `--` so a prompt like "- fix login" is never parsed as a CLI option.
       if (prompt) args.push('--', prompt);
     } else if (isOpenCode) {
-      if (resumeSessionId || info.model) args = withoutOpenCodeModel(args);
+      if (resumeSessionId || info.model) args = withoutModelFlag('opencode', args);
       if (!resumeSessionId && info.model) args.push('--model', info.model);
       if (resumeSessionId) args.push('--session', resumeSessionId);
       if (prompt) args.push('--prompt', prompt);
@@ -1397,7 +1401,7 @@ process.stdin.on('end', () => {
           id: s.id,
           kind: s.kind === 'shell' ? 'shell' : 'agent',
           provider,
-          model: provider === 'opencode' && isValidOpenCodeModel(s.model) ? s.model : undefined,
+          model: isValidModel(provider, s.model) ? s.model : undefined,
           deskId: s.deskId,
           name: s.name ?? 'Worker',
           color: s.color ?? COLORS[0],
@@ -1460,20 +1464,6 @@ function newWorker(info: WorkerInfo, tracker: UsageTracker, hookToken = randomBy
 /** Where a Codex worker's sessions are logged, for reading its usage. */
 function codexHome(cwd: string, env: NodeJS.ProcessEnv): string {
   return path.resolve(cwd, env.CODEX_HOME || path.join(env.HOME || homedir(), '.codex'));
-}
-
-function withoutOpenCodeModel(args: string[]): string[] {
-  const clean: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--model' || arg === '-m') {
-      if (args[i + 1] !== undefined && !args[i + 1].startsWith('-')) i++;
-      continue;
-    }
-    if (arg.startsWith('--model=') || (arg.startsWith('-m') && arg.length > 2)) continue;
-    clean.push(arg);
-  }
-  return clean;
 }
 
 /** The office's environment, minus anything that would make a child think it's a nested session. */
