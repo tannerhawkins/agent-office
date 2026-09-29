@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Ledger } from '../src/server/usage.js';
-import { WorkerManager, type WorkerEvents } from '../src/server/workers.js';
+import { CARRY_ON_PROMPT, WorkerManager, type WorkerEvents } from '../src/server/workers.js';
 import type { AgentProvider, WorkerInfo } from '../src/shared/protocol.js';
+import type { PromptSource } from '../src/server/prompts.js';
+import { PROMPTS } from '../src/shared/prompts.js';
 
 type Invocation = {
   kind: string;
@@ -17,6 +19,7 @@ type Invocation = {
     hookToken?: string;
     hookUrl?: string;
     opencodeConfig?: string;
+    path?: string;
   };
 };
 
@@ -91,6 +94,7 @@ const record = (extra = {}) => fs.appendFileSync(log, JSON.stringify({
     hookToken: process.env.AGENT_OFFICE_HOOK_TOKEN,
     hookUrl: process.env.AGENT_OFFICE_HOOK_URL,
     opencodeConfig: process.env.OPENCODE_CONFIG_CONTENT,
+    path: process.env.PATH,
   },
 }) + '\\n');
 record();
@@ -450,6 +454,91 @@ test('Claude, Cursor and Codex workers start on their picked model, keep it on r
   assert.deepEqual(codexCall.args.slice(-2), ['--', 'codex prompt']);
 });
 
+test('workers reject reasoning effort for non-Claude providers and unknown levels', (t) => {
+  const f = fixture();
+  t.after(() => f.close());
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  assert.match(workers.spawn('desk-1', 'test', 'bad', false, 'agent', 'claude', undefined, 'overdrive' as any) as string, /effort/i);
+  assert.match(workers.spawn('desk-2', 'test', 'bad', false, 'agent', 'opencode', undefined, 'high' as any) as string, /effort|Claude/i);
+  assert.match(workers.spawn('desk-3', 'test', 'bad', false, 'shell', undefined, undefined, 'high' as any) as string, /shell|effort/i);
+});
+
+test('an explicit Claude model/effort overrides --agent-args and persists across resume', async (t) => {
+  const f = fixture();
+  const updates: WorkerInfo[] = [];
+  isolateProviderEnvironment(f, t);
+  const previousExit = process.env.FAKE_AGENT_EXIT_MS;
+  const previousLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_EXIT_MS = '180';
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (previousExit === undefined) delete process.env.FAKE_AGENT_EXIT_MS;
+    else process.env.FAKE_AGENT_EXIT_MS = previousExit;
+    if (previousLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = previousLog;
+    f.close();
+  });
+
+  const workers = manager(f, f.claude, updates, ['--model', 'opus']);
+  t.after(() => workers.shutdown());
+  const worker = workers.spawn('desk-1', 'test', 'haiku task', false, 'agent', 'claude', 'haiku', 'high');
+  assert.equal(typeof worker, 'object');
+  if (typeof worker === 'string') return;
+  assert.equal(workers.get(worker.id)?.model, 'haiku');
+  assert.equal(workers.get(worker.id)?.effort, 'high');
+  const first = await waitFor(() => f.read(), (records) => records.some((r) => r.kind === 'claude'));
+  const firstInvocation = first.find((r) => r.kind === 'claude')!;
+  // The per-worker choice replaces the "opus" in --agent-args.
+  assert.deepEqual(firstInvocation.args.slice(firstInvocation.args.indexOf('--model')), ['--model', 'haiku', '--effort', 'high', '--', 'haiku task']);
+
+  assert.equal(workers.handleHook(worker.id, firstInvocation.env.hookToken!, 'SessionStart', { session_id: 'claude-model-1' }), true);
+  await waitFor(() => workers.get(worker.id)?.status, (status) => status === 'exited');
+  assert.equal(workers.resume(worker.id), undefined);
+  const resumed = await waitFor(() => f.read(), (records) => records.filter((r) => r.kind === 'claude').length >= 2);
+  const secondInvocation = resumed.filter((r) => r.kind === 'claude')[1];
+  assert.ok(secondInvocation.args.includes('--model'));
+  assert.ok(secondInvocation.args.includes('haiku'));
+  assert.ok(secondInvocation.args.includes('--effort'));
+  assert.ok(secondInvocation.args.includes('high'));
+  assert.ok(secondInvocation.args.includes('--resume'));
+
+  workers.shutdown();
+  const restoredUpdates: WorkerInfo[] = [];
+  const restored = manager(f, f.claude, restoredUpdates, ['--model', 'opus']);
+  t.after(() => restored.shutdown());
+  await restored.start();
+  assert.equal(restored.get(worker.id)?.model, 'haiku');
+  assert.equal(restored.get(worker.id)?.effort, 'high');
+});
+
+test('a worker hired on Fable launches with --model fable and keeps it across a restart', async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const previousLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (previousLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = previousLog;
+    f.close();
+  });
+
+  const workers = manager(f, f.claude, [], ['--model', 'opus']);
+  t.after(() => workers.shutdown());
+  const worker = workers.spawn('desk-1', 'test', 'fable task', false, 'agent', 'claude', 'fable');
+  assert.equal(typeof worker, 'object');
+  if (typeof worker === 'string') return;
+  const records = await waitFor(() => f.read(), (rs) => rs.some((r) => r.kind === 'claude'));
+  const launch = records.find((r) => r.kind === 'claude')!;
+  assert.deepEqual(launch.args.slice(launch.args.indexOf('--model')), ['--model', 'fable', '--', 'fable task']);
+
+  workers.shutdown();
+  const restored = manager(f, f.claude, [], ['--model', 'opus']);
+  t.after(() => restored.shutdown());
+  await restored.start();
+  assert.equal(restored.get(worker.id)?.model, 'fable');
+});
+
 test('provider and hook boundaries reject invalid combinations', async (t) => {
   const f = fixture();
   t.after(() => f.close());
@@ -682,7 +771,9 @@ test('a board agent is hired with its brief on the first prompt, then prompted, 
   const [first] = await waitFor(launches, (l) => l.length === 1);
   const initial = first.args.at(-1)!;
   assert.match(initial, /Issues agent/);
-  assert.match(initial, /office\/queue/);
+  assert.match(initial, /office-queue add/);
+  // Only the queue agent loses its file-editing tools.
+  assert.equal(first.args.includes('--disallowedTools'), false);
   assert.ok(initial.endsWith('File an issue about the dog'));
   const id = hired.info.id;
 
@@ -710,6 +801,302 @@ test('a board agent is hired with its brief on the first prompt, then prompted, 
   const [, second] = await waitFor(launches, (l) => l.length === 2);
   assert.ok(second.args.includes('--resume') && second.args.includes('issues-session'));
   assert.equal(second.args.at(-1), 'Close the duplicates');
+});
+
+test('a worker nobody picked a model for starts on the office default, and a board agent is told its rewritten brief', async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const previousLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (previousLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = previousLog;
+    f.close();
+  });
+  const prompts: PromptSource = {
+    text: (id) => (id === 'station.issues' ? 'You triage issues. The request:' : PROMPTS[id].text),
+    agent: () => ({ provider: 'claude', model: 'sonnet', effort: 'low' }),
+  };
+  const workers = new WorkerManager(f.root, f.data, f.claude, ['--from-test'], { url: 'http://127.0.0.1:1', token: '' }, events([]), ledger(f.data), undefined, prompts);
+  t.after(() => workers.shutdown());
+  const launches = (id: string) => f.read().filter((r) => r.kind === 'claude' && r.args.includes('--settings') && r.stdin === undefined && r.env.workerId === id);
+  const flag = (args: string[], name: string) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+
+  const hired = workers.station('station-issues', 'Ada', 'File one about the dog');
+  assert.equal(typeof hired, 'object');
+  if (typeof hired === 'string') return;
+  assert.deepEqual([hired.info.provider, hired.info.model, hired.info.effort], ['claude', 'sonnet', 'low']);
+  const [first] = await waitFor(() => launches(hired.info.id), (l) => l.length === 1);
+  assert.equal(first.args.at(-1), 'You triage issues. The request:\n\nFile one about the dog');
+  assert.deepEqual([flag(first.args, '--model'), flag(first.args, '--effort')], ['sonnet', 'low']);
+
+  // Picked at the desk, the pick wins, down to "the provider's own model".
+  const desk = workers.spawn('desk-1', 'Ada', 'Fix it', false, 'agent', 'claude');
+  assert.equal(typeof desk, 'object');
+  if (typeof desk === 'string') return;
+  assert.deepEqual([desk.provider, desk.model, desk.effort], ['claude', undefined, undefined]);
+  const [own] = await waitFor(() => launches(desk.id), (l) => l.length === 1);
+  assert.equal(own.args.includes('--model'), false);
+});
+
+test('the queue agent is launched without file-editing tools, and board agents get office-queue on their PATH', async (t) => {
+  const f = fixture();
+  const updates: WorkerInfo[] = [];
+  isolateProviderEnvironment(f, t);
+  const previousExit = process.env.FAKE_AGENT_EXIT_MS;
+  const previousLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_EXIT_MS = '600';
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (previousExit === undefined) delete process.env.FAKE_AGENT_EXIT_MS;
+    else process.env.FAKE_AGENT_EXIT_MS = previousExit;
+    if (previousLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = previousLog;
+    f.close();
+  });
+  const workers = manager(f, f.claude, updates);
+  t.after(() => workers.shutdown());
+  const launches = (id: string) => f.read().filter((r) => r.kind === 'claude' && r.args.includes('--settings') && r.stdin === undefined && r.env.workerId === id);
+  const bin = path.join(f.data, 'bin');
+  const onPath = (r: Invocation) => (r.env.path ?? '').split(path.delimiter)[0] === bin;
+  const denied = (args: string[]) => {
+    const i = args.indexOf('--disallowedTools');
+    return i < 0 ? undefined : args.slice(i + 1, i + 4);
+  };
+
+  // The command is there, and runs the shipped script with the office's own node.
+  accessSync(path.join(bin, 'office-queue'), constants.X_OK);
+  assert.match(execFileSync(path.join(bin, 'office-queue'), ['--help'], { encoding: 'utf8' }), /office-queue add --title/);
+
+  const hired = workers.station('station-queue', 'Ada', 'Fix the typo in the README');
+  assert.equal(typeof hired, 'object');
+  if (typeof hired === 'string') return;
+  const id = hired.info.id;
+  const [first] = await waitFor(() => launches(id), (l) => l.length === 1);
+  assert.deepEqual(denied(first.args), ['Edit', 'Write', 'NotebookEdit']);
+  assert.ok(first.args.indexOf('--disallowedTools') < first.args.indexOf('--'), 'the tools come before the prompt');
+  assert.ok(first.args.at(-1)!.endsWith('Fix the typo in the README'));
+  assert.ok(onPath(first), 'office-queue is first on its PATH');
+
+  // Woken up carrying on its session, it's still without them.
+  assert.equal(workers.handleHook(id, first.env.hookToken!, 'SessionStart', { session_id: 'queue-session' }), true);
+  await waitFor(() => workers.get(id)?.status, (s) => s === 'exited');
+  workers.station('station-queue', 'Grace', 'Also bump the version');
+  const [, second] = await waitFor(() => launches(id), (l) => l.length === 2);
+  assert.ok(second.args.includes('--resume') && second.args.includes('queue-session'));
+  assert.deepEqual(denied(second.args), ['Edit', 'Write', 'NotebookEdit']);
+  assert.equal(second.args.at(-1), 'Also bump the version');
+  assert.ok(onPath(second));
+
+  // The other board agents keep their tools but get the command; a desk worker gets neither.
+  const pulls = workers.station('station-pulls', 'Ada', 'Sum up the open PRs');
+  const desk = workers.spawn('desk-2', 'Ada', 'Fix login');
+  assert.ok(typeof pulls === 'object' && typeof desk === 'object');
+  if (typeof pulls !== 'object' || typeof desk !== 'object') return;
+  const [pullsLaunch] = await waitFor(() => launches(pulls.info.id), (l) => l.length === 1);
+  const [deskLaunch] = await waitFor(() => launches(desk.id), (l) => l.length === 1);
+  assert.equal(denied(pullsLaunch.args), undefined);
+  assert.ok(onPath(pullsLaunch));
+  assert.equal(denied(deskLaunch.args), undefined);
+  assert.equal((deskLaunch.env.path ?? '').split(path.delimiter).includes(bin), false);
+});
+
+test('a Claude worker acts out its latest tool call, and puts its head in its hands when its tests keep failing', async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const previousExit = process.env.FAKE_AGENT_EXIT_MS;
+  const previousLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_EXIT_MS = '5000';
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (previousExit === undefined) delete process.env.FAKE_AGENT_EXIT_MS;
+    else process.env.FAKE_AGENT_EXIT_MS = previousExit;
+    if (previousLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = previousLog;
+    f.close();
+  });
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  const worker = workers.spawn('desk-1', 'test', 'make the tests pass');
+  if (typeof worker === 'string') return assert.fail(worker);
+  const [launch] = await waitFor(() => f.read().filter((r) => r.kind === 'claude' && r.args.includes('--settings')), (l) => l.length === 1);
+  const settings = JSON.parse(readFileSync(launch.args[launch.args.indexOf('--settings') + 1], 'utf8'));
+  assert.ok(settings.hooks.PostToolUseFailure, 'failed tool calls are reported');
+
+  const token = launch.env.hookToken!;
+  const hook = (event: string, payload: object) => assert.equal(workers.handleHook(worker.id, token, event, { session_id: 'acting', ...payload }), true);
+  const action = () => workers.get(worker.id)?.action;
+  const npmTest = { tool_name: 'Bash', tool_input: { command: 'npm test 2>&1 | tail -5' } };
+  hook('SessionStart', {});
+  hook('UserPromptSubmit', { prompt: 'make the tests pass' });
+  assert.equal(action(), undefined);
+  hook('PreToolUse', { tool_name: 'Read', tool_input: { file_path: 'src/a.ts' } });
+  assert.equal(action(), 'read');
+  hook('PreToolUse', npmTest);
+  assert.equal(action(), 'test');
+  // Failed once (by exit code): still watching. An interrupt isn't a failure.
+  hook('PostToolUseFailure', { ...npmTest, error: 'Exit code 1\n# fail 2', is_interrupt: false });
+  hook('PostToolUseFailure', { ...npmTest, error: 'Interrupted', is_interrupt: true });
+  assert.equal(action(), 'test');
+  hook('PreToolUse', { tool_name: 'Edit', tool_input: { file_path: 'src/a.ts' } });
+  assert.equal(action(), 'edit');
+  // Failed again, by the summary it printed through the pipe: head in hands, until its next tool call.
+  hook('PreToolUse', npmTest);
+  hook('PostToolUse', { ...npmTest, tool_response: { stdout: '# tests 5\n# pass 3\n# fail 2', stderr: '' } });
+  assert.equal(action(), 'failing');
+  hook('PreToolUse', npmTest);
+  assert.equal(action(), 'test');
+  // A pass ends the streak: one more failure isn't "again and again".
+  hook('PostToolUse', { ...npmTest, tool_response: { stdout: '# tests 5\n# pass 5\n# fail 0', stderr: '' } });
+  hook('PreToolUse', npmTest);
+  hook('PostToolUseFailure', { ...npmTest, error: 'Exit code 1' });
+  assert.equal(action(), 'test');
+  // A failing command that isn't a test run doesn't count.
+  hook('PostToolUseFailure', { tool_name: 'Bash', tool_input: { command: 'git push' }, error: 'Exit code 1' });
+  assert.equal(action(), 'test');
+  hook('Stop', {});
+  assert.equal(workers.get(worker.id)?.status, 'done');
+  assert.equal(action(), undefined);
+});
+
+test('a worker is stamped with when it started waiting on someone, afresh each time', async (t) => {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const oldLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => { if (oldLog === undefined) delete process.env.FAKE_AGENT_LOG; else process.env.FAKE_AGENT_LOG = oldLog; f.close(); });
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  const worker = workers.spawn('desk-1', 'test', 'fix the login');
+  assert.notEqual(typeof worker, 'string'); if (typeof worker === 'string') return;
+  const calls = await waitFor(f.read, (x) => x.some((r) => r.kind === 'claude' && r.args.includes('--settings')));
+  const token = calls.find((r) => r.kind === 'claude' && r.args.includes('--settings'))!.env.hookToken!;
+  const hook = (event: string, extra = {}) => workers.handleHook(worker.id, token, event, { session_id: 'waiting', ...extra });
+  hook('SessionStart');
+  hook('UserPromptSubmit', { prompt: 'fix the login' });
+  assert.equal(worker.status, 'working');
+  assert.equal(worker.waitingSince, undefined);
+  const before = Date.now();
+  hook('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'npm test' } });
+  assert.equal(worker.status, 'needs_input');
+  const asked = worker.waitingSince!;
+  assert.ok(asked >= before && asked <= Date.now());
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  hook('PostToolUse', { tool_name: 'Bash' });
+  hook('Stop');
+  assert.equal(worker.status, 'done');
+  assert.ok(worker.waitingSince! > asked, 'finishing is a new wait');
+});
+
+/** Each Claude worker launch so far (not the task namer's calls), oldest first. */
+const launches = (f: Fixture) => f.read().filter((r) => r.kind === 'claude' && r.args.includes('--settings'));
+/** What a launch was told to do: the prompt after `--`, if any. */
+const promptOf = (r: Invocation) => (r.args.includes('--') ? r.args[r.args.indexOf('--') + 1] : undefined);
+
+function carryOnFixture(t: { after(fn: () => void): void }) {
+  const f = fixture();
+  isolateProviderEnvironment(f, t);
+  const oldLog = process.env.FAKE_AGENT_LOG;
+  process.env.FAKE_AGENT_LOG = f.log;
+  t.after(() => {
+    if (oldLog === undefined) delete process.env.FAKE_AGENT_LOG;
+    else process.env.FAKE_AGENT_LOG = oldLog;
+    f.close();
+  });
+  return f;
+}
+
+/** Hires a Claude worker and puts its session in `state`: mid-turn ('working', 'needs_input') or finished ('done'). */
+async function hireInState(f: Fixture, workers: WorkerManager, deskId: string, session: string, state: 'working' | 'needs_input' | 'done') {
+  const before = launches(f).length;
+  const worker = workers.spawn(deskId, 'test', `task for ${session}`);
+  assert.notEqual(typeof worker, 'string');
+  if (typeof worker === 'string') throw new Error(worker);
+  const token = (await waitFor(() => launches(f), (x) => x.length > before)).at(-1)!.env.hookToken!;
+  const hook = (event: string, extra = {}) => assert.equal(workers.handleHook(worker.id, token, event, { session_id: session, ...extra }), true);
+  hook('SessionStart');
+  hook('UserPromptSubmit', { prompt: `task for ${session}` });
+  if (state === 'needs_input') hook('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'npm test' } });
+  if (state === 'done') hook('Stop');
+  assert.equal(workers.get(worker.id)?.status, state);
+  return worker;
+}
+
+test('a restart that takes a mid-turn worker down resumes it with continue; a finished one just wakes up', async (t) => {
+  const f = carryOnFixture(t);
+  const before = manager(f, f.claude, []);
+  // Never started, so its terminals run in-process and go down with it.
+  await hireInState(f, before, 'desk-1', 'mid-turn', 'working');
+  await hireInState(f, before, 'desk-2', 'asking', 'needs_input');
+  await hireInState(f, before, 'desk-3', 'finished', 'done');
+  before.shutdown(true);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  const after = manager(f, f.claude, []);
+  t.after(() => after.shutdown());
+  await after.start();
+  const resumed = (await waitFor(() => launches(f), (x) => x.length >= 6)).slice(3);
+  const of = (session: string) => resumed.find((r) => r.args.includes(session))!;
+  for (const session of ['mid-turn', 'asking']) {
+    assert.ok(of(session).args.includes('--resume'));
+    assert.equal(promptOf(of(session)), CARRY_ON_PROMPT);
+  }
+  assert.ok(of('finished').args.includes('--resume'));
+  assert.equal(promptOf(of('finished')), undefined);
+});
+
+test('a worker whose terminal outlives the office is picked back up mid-turn, not relaunched or told to continue', async (t) => {
+  const f = carryOnFixture(t);
+  const before = manager(f, f.claude, []);
+  await before.start();
+  const worker = await hireInState(f, before, 'desk-1', 'kept', 'working');
+  before.shutdown(true);
+
+  const after = manager(f, f.claude, []);
+  t.after(() => after.shutdown());
+  await after.start();
+  assert.equal(after.get(worker.id)?.status, 'working');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(launches(f).length, 1);
+});
+
+test('a worker whose terminal was in the host when an older office went down carries on if the host is gone', async (t) => {
+  const f = carryOnFixture(t);
+  // workers.json as the office before midTurn left it: only the host terminal's status says it was mid-turn.
+  const saved = (id: string, deskId: string, sessionId: string, status: string) => ({
+    id,
+    kind: 'agent',
+    provider: 'claude',
+    deskId,
+    name: id,
+    sessionId,
+    hookToken: `${id}-token`,
+    pty: { id: `${id}-pty`, status, acked: true },
+  });
+  writeFileSync(path.join(f.data, 'workers.json'), JSON.stringify([saved('upgraded', 'desk-1', 'was-working', 'working'), saved('idle', 'desk-2', 'was-done', 'done')]));
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  await workers.start();
+  const resumed = await waitFor(() => launches(f), (x) => x.length >= 2);
+  assert.equal(promptOf(resumed.find((r) => r.args.includes('was-working'))!), CARRY_ON_PROMPT);
+  assert.equal(promptOf(resumed.find((r) => r.args.includes('was-done'))!), undefined);
+});
+
+test('stopping the office on purpose (Ctrl+C) leaves nothing to carry on', async (t) => {
+  const f = carryOnFixture(t);
+  const before = manager(f, f.claude, []);
+  // Its terminals run in the host, which ends them without telling the office they exited.
+  await before.start();
+  await hireInState(f, before, 'desk-1', 'stopped', 'working');
+  before.shutdown(false);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  const after = manager(f, f.claude, []);
+  t.after(() => after.shutdown());
+  await after.start();
+  const resumed = (await waitFor(() => launches(f), (x) => x.length >= 2))[1];
+  assert.ok(resumed.args.includes('stopped'));
+  assert.equal(promptOf(resumed), undefined);
 });
 
 test('Cursor workers run cursor-agent with the office plugin, follow its hooks and screen, count turns once, and resume', async (t) => {
@@ -834,7 +1221,7 @@ test("worktree workers' branches follow the floor's template", async (t) => {
 
   let template: string | undefined = '{user}/{issue}-{slug}';
   workers.branchTemplate = () => template;
-  const queued = workers.spawn('desk-2', 'Sam (queue)', 'long prompt text', true, 'agent', 'claude', undefined, { title: 'Add dark mode', issue: 7, user: 'Robin' });
+  const queued = workers.spawn('desk-2', 'Sam (queue)', 'long prompt text', true, 'agent', 'claude', undefined, undefined, undefined, { title: 'Add dark mode', issue: 7, user: 'Robin' });
   assert.equal(typeof queued === 'object' && queued.worktree!.branch, 'robin/7-add-dark-mode');
   const handed = workers.spawn('desk-3', 'Sam', 'Work on GitHub issue #42: "Login breaks".\n\nRead it first', true);
   assert.equal(typeof handed === 'object' && handed.worktree!.branch, 'sam/42-login-breaks');

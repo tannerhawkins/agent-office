@@ -1,4 +1,4 @@
-import type { AgentProvider, ServerMsg, WorktreeCleanup, WorktreeState } from '../../shared/protocol';
+import type { AgentEffort, AgentProvider, ServerMsg, WorktreeCleanup, WorktreeState } from '../../shared/protocol';
 import { h, openModal } from './dom';
 import { store } from '../state';
 import { providerPicker, type ProviderPicker } from './provider';
@@ -6,6 +6,8 @@ import { providerPicker, type ProviderPicker } from './provider';
 export interface PromptOptions {
   title: string;
   subtitle?: string;
+  /** A warning over the prompt, e.g. that the machine is under pressure. */
+  warning?: string;
   placeholder?: string;
   initial?: string;
   submitLabel?: string;
@@ -15,11 +17,12 @@ export interface PromptOptions {
   worktreeOption?: boolean;
   /** Offer the configured agent provider choice (only when hiring a new worker). */
   providerOption?: boolean;
-  onSubmit(text: string, opts: { worktree: boolean; provider?: AgentProvider; model?: string }): void;
+  onSubmit(text: string, opts: { worktree: boolean; provider?: AgentProvider; model?: string; effort?: AgentEffort }): void;
 }
 
 const WT_KEY = 'agent-office.worktree';
-function worktreePref(): boolean {
+/** Whether the last hire asked for its own git worktree (the Ask window shares the choice). */
+export function worktreePref(): boolean {
   try {
     return localStorage.getItem(WT_KEY) === '1';
   } catch {
@@ -47,7 +50,7 @@ export function openPrompt(opts: PromptOptions) {
     'form.modal',
     { role: 'dialog', 'aria-label': opts.title },
     h('header', {}, h('h2', {}, opts.title)),
-    h('div.body', {}, opts.subtitle ? h('p', { style: 'margin:0 0 10px;font-weight:700;color:var(--muted)' }, opts.subtitle) : null, ta, provider?.element ?? null, wtRow),
+    h('div.body', {}, opts.warning ? h('p.setting-note.bad', { style: 'margin:0 0 10px', role: 'alert' }, opts.warning) : null, opts.subtitle ? h('p', { style: 'margin:0 0 10px;font-weight:700;color:var(--muted)' }, opts.subtitle) : null, ta, provider?.element ?? null, wtRow),
     h('footer', {}, h('span.grow', {}, 'Enter to send · Shift+Enter for a new line'), cancel, submit),
   ) as HTMLFormElement;
   form.noValidate = true;
@@ -69,7 +72,7 @@ export function openPrompt(opts: PromptOptions) {
         // storage blocked
       }
     }
-    opts.onSubmit(text, { worktree: !!opts.worktreeOption && wtBox.checked, provider: provider?.value(), model: provider?.model() });
+    opts.onSubmit(text, { worktree: !!opts.worktreeOption && wtBox.checked, provider: provider?.value(), model: provider?.model(), effort: provider?.effort() });
   };
   form.addEventListener('submit', (e) => {
     e.preventDefault();

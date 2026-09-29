@@ -1,17 +1,20 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, accessSync, constants } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, accessSync, chmodSync, mkdirSync, constants } from 'node:fs';
 import { execFile, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { CodexUsageReader } from './codex-usage.js';
 import headless from '@xterm/headless';
 import serialize from '@xterm/addon-serialize';
-import type { AgentProvider, Run, TerminalHit, WorkerInfo, WorkerKind, WorkerStatus, WorkerTask } from '../shared/protocol.js';
-import { FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, RGB_FLAG } from '../shared/protocol.js';
+import type { AgentChoice, AgentEffort, AgentProvider, Run, TerminalHit, WorkerInfo, WorkerKind, WorkerStatus, WorkerTask } from '../shared/protocol.js';
+import { FAILS_TO_DESPAIR, outputFailed, toolAction } from '../shared/actions.js';
+import { FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, RGB_FLAG, isAgentEffort, isClaudeModel } from '../shared/protocol.js';
 import { branchName, issueFromPrompt } from '../shared/branches.js';
 import { Worktrees, describeWork, type WorktreeCleanup, type WorktreeState } from './worktrees.js';
 import { DESK_BY_ID, STATION_AGENT } from '../shared/layout.js';
-import { stationBrief } from './stations.js';
+import { QUEUE_AGENT_DISALLOWED_TOOLS, stationBrief } from './stations.js';
+import { officePrompt, type PromptSource } from './prompts.js';
 import { isBusy } from '../shared/status.js';
 import { gh } from './github.js';
 import type { ServiceOwner } from './services.js';
@@ -20,10 +23,12 @@ import { addUsage, newTracker, restoreTracker, scanTracker, trackerUsage, zeroUs
 import { PtyHost, SCROLLBACK, type Adopted, type Pty } from './ptys.js';
 import { codexHookArgs, normalizeCodexHook, writeCodexHook } from './codex.js';
 import { reportedUsage } from './reported-usage.js';
-import { configuredProvider, isValidModel, MODEL_FLAGS, providerCommand, validateWorkerModel, withoutModelFlag } from './agents.js';
+import { configuredProvider, isValidModel, MODEL_FLAGS, providerCommand, validateWorkerEffort, validateWorkerModel, withoutModelFlag } from './agents.js';
 import { CURSOR_APPROVAL, CURSOR_LOGGED_OUT, CURSOR_READY, CURSOR_SETUP, CURSOR_TITLE, cursorArgs, normalizeCursorHook, writeCursorPlugin } from './cursor.js';
 import { mergeOpenCodeConfigContent, openCodePluginSpecifier, writeOpenCodePlugin, type OpenCodeStatusEvent } from './opencode.js';
 import { ScrollbackStore, searchTerminal, terminalTail } from './history.js';
+import { screenSnapshot } from './screen.js';
+import type { Capacity } from './machine.js';
 
 type HeadlessTerminal = InstanceType<typeof headless.Terminal>;
 
@@ -71,6 +76,12 @@ const USAGE_SCAN_MS = 10_000;
 const SAVE_SCROLLBACK_MS = 15_000;
 /** Between a worker's saved scrollback and what it prints after the office restarted. */
 const RESTORED_NOTE = '\x1b[2m──── the office restarted · earlier output above ────\x1b[0m\r\n';
+/**
+ * What a worker whose terminal didn't make it through a restart (the machine rebooted, the terminal
+ * host was replaced or died) is resumed with when it was in the middle of something, so it carries on
+ * by itself instead of waiting at every desk for someone to type "continue".
+ */
+export const CARRY_ON_PROMPT = 'continue — the office restarted and interrupted you. Pick up where you left off; if you were waiting on an answer or a permission, ask again.';
 
 export interface HookEnv {
   url: string;
@@ -82,6 +93,8 @@ interface Worker {
   pty?: Pty;
   term?: HeadlessTerminal;
   ser?: InstanceType<typeof serialize.SerializeAddon>;
+  /** The screen so far, for a browser opening the terminal (see screen.ts). */
+  snapshot?: () => string;
   viewers: Map<string, string>; // clientId -> name
   screenDirty: boolean;
   lastLines: string[];
@@ -106,6 +119,8 @@ interface Worker {
   setup?: string;
   /** Its latest tool, to say what an approval prompt is about. */
   lastTool?: string;
+  /** Test runs and builds that have failed in a row (see FAILS_TO_DESPAIR). */
+  failStreak: number;
   /** Its latest prompts and tool calls, for naming its task. */
   prompts: string[];
   tools: string[];
@@ -117,7 +132,9 @@ interface Worker {
   tracker: UsageTracker;
   scanTimer?: NodeJS.Timeout;
   /** Its terminal in the host as of the last save, and how it was doing, to pick back up after a restart. */
-  saved?: { ptyId: string; status: WorkerStatus; acked: boolean };
+  saved?: { ptyId: string; status: WorkerStatus; acked: boolean; waitingSince?: number };
+  /** Its process went away mid-turn with the office or the terminal host: its next start carries on (CARRY_ON_PROMPT). */
+  interrupted?: boolean;
   /** Output since its scrollback was last saved to disk. */
   unsaved?: boolean;
   /** Where this run's own output starts, below the scrollback carried over from before. */
@@ -152,9 +169,13 @@ export class WorkerManager {
   private openCodePlugin: string;
   private codexHook: string;
   private cursorPlugin: string;
+  /** Where the office-queue command is, for the board agents' PATH (see writeQueueCommand). */
+  private queueBin: string | undefined;
   private screenTimer: NodeJS.Timeout;
   /** The office is shutting down: workers exiting now are being stopped, not failing to resume. */
   private closing = false;
+  /** Closing for good (Ctrl+C), not restarting: whatever the workers were doing is stopped on purpose. */
+  private stopping = false;
   private namer: TaskNamer;
   private usageTimer: NodeJS.Timeout;
   /** Runs the workers' terminals outside the office, so they outlive a restart of it (see ptys.ts). */
@@ -171,6 +192,10 @@ export class WorkerManager {
     private hook: HookEnv,
     private events: WorkerEvents,
     private ledger: Ledger,
+    /** The office's worker limit, across every floor (see machine.ts). */
+    private capacity?: Capacity,
+    /** The office's prompts and the worker everyone starts on, as set in ⚙️ Settings (see prompts.ts). */
+    private prompts?: PromptSource,
   ) {
     this.defaultProvider = configuredProvider(agentCmd);
     this.trees = new Worktrees(dir);
@@ -180,9 +205,10 @@ export class WorkerManager {
     this.openCodePlugin = writeOpenCodePlugin(dataDir);
     this.codexHook = writeCodexHook(dataDir);
     this.cursorPlugin = writeCursorPlugin(dataDir);
+    this.queueBin = this.writeQueueCommand();
     this.agentPath = resolveCommand(agentCmd);
     const claude = this.defaultProvider === 'claude' ? this.agentPath : resolveCommand('claude');
-    this.namer = new TaskNamer(claude, childEnv(), (id, task, ctx) => {
+    this.namer = new TaskNamer(claude, childEnv(), () => officePrompt(this.prompts, 'office.namer'), (id, task, ctx) => {
       const w = this.workers.get(id);
       if (!w || w.taskEpoch !== ctx.epoch) return;
       w.info.task = task;
@@ -207,7 +233,8 @@ export class WorkerManager {
   /**
    * Picks every worker whose terminal outlived the last office (a dev-server reload, an upgrade)
    * back up where it is, mid-turn or not. Whoever else was at a desk when the office stopped (a
-   * restart, a crash) gets straight back to work. Call once, before anyone can walk in.
+   * restart, a crash) gets straight back to work, carrying on with whatever it was in the middle of.
+   * Call once, before anyone can walk in.
    */
   async start() {
     await this.host.connect();
@@ -226,6 +253,13 @@ export class WorkerManager {
 
   get resolvedAgent(): string | null {
     return this.agentPath;
+  }
+
+  /** What an agent starts on when whoever starts it doesn't pick: the one set in ⚙️ Settings, or the office's --agent. */
+  get officeDefault(): AgentChoice {
+    const picked = this.prompts?.agent();
+    if (picked && (picked.provider !== 'custom' || this.defaultProvider === 'custom')) return picked;
+    return { provider: this.defaultProvider };
   }
 
   list(): WorkerInfo[] {
@@ -253,30 +287,39 @@ export class WorkerManager {
   }
 
   /**
-   * Hires a worker at a desk. `task` says what its branch is named after when it gets a worktree
-   * (see the floor's branch template); without one, a task handed over from the issues board is
-   * recognized in the prompt.
+   * Hires a worker at a desk. `meeting` seats one at the meeting room's table instead, for that meeting
+   * (see meetings.ts), in the meeting's own worktree, which everyone at the table shares. `task` says
+   * what its branch is named after when it gets a worktree (see the floor's branch template); without
+   * one, a task handed over from the issues board is recognized in the prompt.
    */
-  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', provider?: AgentProvider, model?: string, task?: BranchTask): WorkerInfo | string {
-    const selectedProvider = kind === 'agent' ? provider ?? this.defaultProvider : undefined;
+  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', provider?: AgentProvider, model?: string, effort?: AgentEffort, meeting?: { id: string; worktree?: WorkerInfo['worktree'] }, task?: BranchTask): WorkerInfo | string {
+    // Nobody picked (a board agent, say): the office's default worker, model and effort included.
+    if (kind === 'agent' && provider === undefined) ({ provider, model, effort } = this.officeDefault);
+    const selectedProvider = kind === 'agent' ? provider : undefined;
     const modelError = validateWorkerModel(kind, selectedProvider, model);
     if (modelError) return modelError;
+    const effortError = validateWorkerEffort(kind, selectedProvider, effort);
+    if (effortError) return effortError;
     const seat = DESK_BY_ID.get(deskId);
     if (!seat) return 'Unknown desk';
     if (this.deskOccupied(deskId)) return seat.station ? `The ${STATION_AGENT[seat.station].name} is already there` : `That ${seat.beanbag ? 'bean bag' : 'desk'} is taken`;
     if (kind === 'shell' && seat.station) return 'A board agent is always an agent, not a shell';
     if (seat.station && !prompt?.trim()) return 'Tell the board agent what to do';
+    if (!seat.room !== !meeting) return seat.room ? 'Only a meeting seats workers at the meeting table: call one in the meeting room' : 'A meeting seats its workers at the meeting table';
+    if (meeting && (kind !== 'agent' || worktree)) return 'A meeting seats agents, in its own worktree';
     if (kind === 'shell' && provider !== undefined) return 'Shell workers do not have an agent provider';
     if (kind === 'agent' && selectedProvider === 'custom' && this.defaultProvider !== 'custom') return 'Custom is not the configured agent provider';
     if (kind === 'agent') {
       const paused = this.ledger.hiringPaused;
       if (paused) return paused;
     }
+    const full = this.capacity?.full();
+    if (full) return full;
     const used = new Set([...this.workers.values()].map((w) => w.info.name.replace(/ 🐚$/, '')));
     const agent = seat.station && STATION_AGENT[seat.station];
     const name = agent ? agent.name : (NAMES.find((n) => !used.has(n)) ?? `Worker ${this.workers.size + 1}`);
     const id = randomBytes(6).toString('hex');
-    let wt: WorkerInfo['worktree'];
+    let wt: WorkerInfo['worktree'] = meeting?.worktree;
     if (worktree) {
       const handed = task ? undefined : issueFromPrompt(prompt);
       const branch = branchName(this.branchTemplate(), {
@@ -295,6 +338,7 @@ export class WorkerManager {
       kind,
       provider: selectedProvider,
       model: isValidModel(selectedProvider, model) ? model : undefined,
+      effort: selectedProvider === 'claude' ? effort : undefined,
       deskId,
       name: kind === 'shell' ? `${name} 🐚` : name,
       color: kind === 'shell' ? '#8d99ae' : agent ? agent.color : COLORS[Math.floor(Math.random() * COLORS.length)],
@@ -307,14 +351,17 @@ export class WorkerManager {
       cols: 100,
       rows: 30,
       viewers: [],
+      viewerIds: [],
       activity: prompt ? truncate(prompt, 80) : undefined,
+      meeting: meeting?.id,
     };
     const w = newWorker(info, newTracker());
-    if (wt) w.setup = this.trees.setupScript(wt.path);
+    // A meeting's shared worktree is set up once, not by each worker at its table.
+    if (wt && !meeting) w.setup = this.trees.setupScript(wt.path);
     this.workers.set(id, w);
     if (info.prompt) this.notePrompt(w, info.prompt);
     // A board agent is told what it's there for ahead of its first request (which is what shows).
-    this.launch(w, seat.station && info.prompt ? `${stationBrief(seat.station)}\n\n${info.prompt}` : info.prompt, undefined);
+    this.launch(w, seat.station && info.prompt ? `${stationBrief(seat.station, this.prompts)}\n\n${info.prompt}` : info.prompt, undefined);
     this.persist();
     return info;
   }
@@ -328,12 +375,15 @@ export class WorkerManager {
     w.info.exitCode = undefined;
     const station = DESK_BY_ID.get(w.info.deskId)?.station;
     // A board agent with no session to carry on starts over, so it needs telling what it's for again.
-    const first = prompt && station && !w.info.sessionId ? `${stationBrief(station)}\n\n${prompt}` : prompt;
+    const first = prompt && station && !w.info.sessionId ? `${stationBrief(station, this.prompts)}\n\n${prompt}` : prompt;
     if (prompt) {
       w.info.activity = truncate(prompt, 80);
       this.notePrompt(w, prompt);
     }
-    this.launch(w, first, w.info.sessionId);
+    // Cut off mid-turn by a restart: it gets on with it, as whoever was watching would have told it to.
+    const carryOn = !prompt && w.interrupted && w.info.kind === 'agent' && !!w.info.sessionId;
+    w.interrupted = false;
+    this.launch(w, carryOn ? CARRY_ON_PROMPT : first, w.info.sessionId);
     return undefined;
   }
 
@@ -371,10 +421,11 @@ export class WorkerManager {
 
   /**
    * Sends a worker home. For one with its own worktree, `cleanup` says what becomes of it; with no
-   * choice given, the worktree and branch go only when they hold no work. Resolves once that's done,
-   * with a line for the team about the worktree.
+   * choice given, the worktree and branch go only when they hold no work, where `landed` (its merged
+   * pull request's head commit) is work delivered. Resolves once that's done, with a line for the team
+   * about the worktree.
    */
-  async kill(id: string, cleanup?: WorktreeCleanup): Promise<{ note?: string; error?: string }> {
+  async kill(id: string, cleanup?: WorktreeCleanup, landed?: string): Promise<{ note?: string; error?: string }> {
     const w = this.workers.get(id);
     if (!w) return {};
     this.workers.delete(id);
@@ -392,10 +443,11 @@ export class WorkerManager {
     this.events.remove(id);
     this.persist();
     const wt = w.info.worktree;
-    if (!wt) return {};
+    // A meeting's worktree is everyone at the table's: the meeting tidies it away once they've all gone.
+    if (!wt || w.info.meeting) return {};
     const name = w.info.name;
     if (!cleanup) {
-      const work = describeWork(await this.trees.inspect(wt));
+      const work = describeWork(await this.trees.inspect(wt, landed));
       if (work) return { note: `Kept ${name}'s worktree and branch ${wt.branch} — it has ${work}` };
       cleanup = 'all';
     }
@@ -421,7 +473,7 @@ export class WorkerManager {
       changed = true;
     }
     if (changed) this.emitUpdate(w);
-    const data = w.ser ? w.ser.serialize({ scrollback: SCROLLBACK }) : offlineBanner(w.info);
+    const data = w.snapshot ? w.snapshot() : offlineBanner(w.info);
     return { data, cols: w.info.cols, rows: w.info.rows };
   }
 
@@ -589,7 +641,10 @@ export class WorkerManager {
     this.scheduleScan(w);
     switch (event) {
       case 'SessionStart':
-        if (payload?.source === 'clear') this.clearTask(w);
+        if (payload?.source === 'clear') {
+          this.clearTask(w);
+          w.failStreak = 0;
+        }
         if (w.info.status === 'starting' || (w.bootBlocked && w.info.status === 'needs_input')) {
           w.bootBlocked = false;
           this.setStatus(w, 'idle');
@@ -597,6 +652,7 @@ export class WorkerManager {
         break;
       case 'UserPromptSubmit':
         w.bootBlocked = false;
+        w.info.action = undefined;
         if (typeof payload?.prompt === 'string') {
           w.info.activity = truncate(payload.prompt, 80);
           this.notePrompt(w, payload.prompt);
@@ -608,12 +664,15 @@ export class WorkerManager {
         if (payload?.tool_name === 'AskUserQuestion') this.setStatus(w, 'needs_input');
         else {
           w.info.activity = describeTool(payload);
+          w.info.action = toolAction(payload?.tool_name, payload?.tool_input);
           this.noteTool(w, w.info.activity);
           if (w.info.status !== 'working') this.setStatus(w, 'working');
           else this.emitUpdate(w);
         }
         break;
       case 'PostToolUse':
+      case 'PostToolUseFailure':
+        this.noteOutcome(w, payload, event === 'PostToolUseFailure');
         if (w.info.status === 'needs_input') {
           w.leftNeedsInputAt = now;
           this.setStatus(w, 'working');
@@ -672,6 +731,7 @@ export class WorkerManager {
         break;
       case 'UserPromptSubmit':
         clearPending();
+        w.info.action = undefined;
         if (report.prompt) {
           w.info.activity = truncate(report.prompt, 80);
           this.notePrompt(w, report.prompt);
@@ -680,6 +740,7 @@ export class WorkerManager {
         break;
       case 'PreToolUse':
         w.info.activity = report.tool ? truncate(report.tool, 80) : 'Using a tool';
+        w.info.action = toolAction(report.tool);
         if (report.toolUseId && w.codexTools.size < 256) w.codexTools.set(report.toolUseId, report.tool ?? '');
         if (/(?:^|[.])(?:AskUserQuestion|request_user_input)$/.test(report.tool ?? '')) {
           if (report.toolUseId) w.codexPending.add(report.toolUseId);
@@ -807,9 +868,11 @@ export class WorkerManager {
     else if (payload.status === 'working' || payload.prompt) w.openCodeError = false;
     if (payload.prompt) {
       w.info.activity = truncate(payload.prompt, 80);
+      w.info.action = undefined;
       this.notePrompt(w, payload.prompt);
     } else if (payload.tool) {
       w.info.activity = truncate(payload.tool, 80);
+      w.info.action = toolAction(payload.tool);
     } else if (payload.detail) {
       w.info.activity = truncate(payload.detail, 80);
     }
@@ -825,8 +888,8 @@ export class WorkerManager {
   private notePrompt(w: Worker, prompt: string) {
     if (w.info.kind !== 'agent') return;
     const clean = prompt.replace(/\s+/g, ' ').trim();
-    // Bare slash commands (/model, /compact) and repeats aren't new work.
-    if (!clean || /^\/\S+$/.test(clean) || w.prompts.at(-1) === clean) return;
+    // Bare slash commands (/model, /compact), repeats and the office's own carry-on aren't new work.
+    if (!clean || /^\/\S+$/.test(clean) || w.prompts.at(-1) === clean || clean === CARRY_ON_PROMPT) return;
     w.prompts = [...w.prompts, clean].slice(-TASK_PROMPTS);
     const hadTask = !!w.info.task;
     if (!hadTask) w.info.task = fallbackTask(clean);
@@ -841,6 +904,24 @@ export class WorkerManager {
     w.tools = [...w.tools, tool].slice(-TASK_TOOLS);
     w.toolsSinceNamed++;
     if (w.info.task && w.toolsSinceNamed >= TASK_REFRESH_TOOLS && Date.now() - w.namedAt > TASK_REFRESH_MS) this.nameTask(w);
+  }
+
+  /**
+   * A tool call finished. Tests or a build that failed again (by exit code, or by the summary it
+   * printed when the exit code was piped away) and the worker puts its head in its hands, until its
+   * next tool call; a passing run ends the streak.
+   */
+  private noteOutcome(w: Worker, payload: any, failed: boolean) {
+    if (payload?.is_interrupt || toolAction(payload?.tool_name, payload?.tool_input) !== 'test') return;
+    const res = payload?.tool_response;
+    const output = [payload?.error, res?.stdout, res?.stderr].filter((s) => typeof s === 'string').join('\n');
+    if (!failed && !outputFailed(output)) {
+      w.failStreak = 0;
+      return;
+    }
+    if (++w.failStreak < FAILS_TO_DESPAIR || w.info.action === 'failing') return;
+    w.info.action = 'failing';
+    this.emitUpdate(w);
   }
 
   private nameTask(w: Worker) {
@@ -869,6 +950,7 @@ export class WorkerManager {
    */
   shutdown(keep = false) {
     this.closing = true;
+    this.stopping = !keep;
     clearInterval(this.screenTimer);
     clearInterval(this.usageTimer);
     clearInterval(this.saveTimer);
@@ -878,6 +960,8 @@ export class WorkerManager {
       // Before the process goes, so the next office shows what it was doing, not how it was stopped.
       if (w.unsaved) this.saveScrollback(w);
       if (keep && w.pty?.id) continue;
+      // A restart only takes this one down because it runs in-process: the next office carries on its turn.
+      if (keep && midTurn(w)) w.interrupted = true;
       try {
         w.pty?.kill();
       } catch {
@@ -906,7 +990,7 @@ export class WorkerManager {
       });
     }
 
-    const shell = process.env.SHELL || '/bin/bash';
+    const shell = defaultShell();
     const isShell = info.kind === 'shell';
     const provider = info.provider;
     const isClaude = !isShell && provider === 'claude';
@@ -914,15 +998,20 @@ export class WorkerManager {
     const isCodex = !isShell && provider === 'codex';
     const isCursor = !isShell && provider === 'cursor';
     const configured = !isShell && provider === this.defaultProvider;
+    const station = DESK_BY_ID.get(info.deskId)?.station;
     const command = this.command(info);
     const commandPath = isShell ? undefined : configured ? this.agentPath : resolveCommand(command);
-    let args = isShell ? ['-l'] : configured ? [...this.agentArgs] : [];
+    let args = isShell ? (WIN && !process.env.SHELL ? [] : ['-l']) : configured ? [...this.agentArgs] : [];
     // The worker's model replaces any in --agent-args, and goes in again on a resume so it stays
     // on that model. OpenCode's session remembers its own, so it only gets one on the first launch.
     const modelFlag = !isShell && provider ? MODEL_FLAGS[provider] : undefined;
     if (modelFlag && info.model && !isOpenCode) args = [...withoutModelFlag(provider!, args), modelFlag.long, info.model];
     if (isClaude) {
       args.unshift('--settings', this.settingsPath);
+      // An effort chosen for this worker overrides whatever --agent-args set office-wide (the model went in above).
+      if (info.effort) args.push('--effort', info.effort);
+      // The queue agent only ever adds to the queue: without these it can't touch the checkout's files.
+      if (station === 'queue') args.push('--disallowedTools', ...QUEUE_AGENT_DISALLOWED_TOOLS);
       if (resumeSessionId) args.push('--resume', resumeSessionId);
       // `--` so a prompt like "- fix login" is never parsed as a CLI option.
       if (prompt) args.push('--', prompt);
@@ -956,6 +1045,12 @@ export class WorkerManager {
       AGENT_OFFICE_HOOK_URL: this.hook.url,
       AGENT_OFFICE_HOOK_TOKEN: w.hookToken,
     });
+    // A board agent reaches the queue with the office-queue command, whichever agent it runs.
+    if (station && this.queueBin) {
+      // Windows spells it Path.
+      const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+      env[key] = [this.queueBin, env[key]].filter(Boolean).join(path.delimiter);
+    }
 
     const cwd = this.cwd(info);
     if (isCodex) w.codexHome = codexHome(cwd, env);
@@ -976,7 +1071,7 @@ export class WorkerManager {
       } else {
         // Not found on PATH: let a login shell find it (nvm, asdf, ~/.local/bin ...).
         const line = ['exec', command, ...args].map((a, i) => (i < 2 ? a : shq(a))).join(' ');
-        run = { file: shell, args: ['-l', '-i', '-c', line] };
+        run = { file: shell, args: shellRun(line) };
       }
       if (w.setup) {
         // The worktree's setup goes first, in the same terminal so its output shows, then the worker.
@@ -998,6 +1093,8 @@ export class WorkerManager {
   /** Takes back a terminal the host kept running while the office was down. */
   private adopt(w: Worker, adopted: Adopted, saved: NonNullable<Worker['saved']>) {
     const { info } = w;
+    // It kept working through the restart: nothing to carry on.
+    w.interrupted = false;
     info.cols = adopted.cols;
     info.rows = adopted.rows;
     const term = this.newTerm(w);
@@ -1011,6 +1108,7 @@ export class WorkerManager {
     if (info.status === 'offline') {
       info.status = saved.status;
       info.acked = saved.acked;
+      info.waitingSince = saved.waitingSince;
     }
     if (info.provider === 'codex') w.codexHome = codexHome(this.cwd(info), childEnv());
     this.follow(w, adopted.pty, term, undefined);
@@ -1038,6 +1136,7 @@ export class WorkerManager {
     w.term?.dispose();
     w.term = term;
     w.ser = ser;
+    w.snapshot = screenSnapshot(term, ser);
     w.lastLines = [];
     w.screenDirty = true;
     w.fresh = undefined;
@@ -1074,6 +1173,7 @@ export class WorkerManager {
       }
       // The terminal host died and took the process with it: nothing the worker did.
       if (lost && !this.closing) {
+        if (midTurn(w)) w.interrupted = true;
         this.resume(info.id);
         return;
       }
@@ -1125,7 +1225,7 @@ export class WorkerManager {
 
   /** What a worker's terminal runs: the shell, the configured agent command, or another provider's CLI. */
   private command(info: WorkerInfo): string {
-    if (info.kind === 'shell') return process.env.SHELL || '/bin/bash';
+    if (info.kind === 'shell') return defaultShell();
     if (info.provider === this.defaultProvider || !info.provider) return this.agentCmd;
     return providerCommand(info.provider);
   }
@@ -1181,9 +1281,14 @@ export class WorkerManager {
     if (w.info.status === status) return;
     if (w.info.status === 'needs_input') w.leftNeedsInputAt = Date.now();
     w.info.status = status;
-    // Nobody is looking at the terminal right now -> raise the flag (the worker jumps).
-    if (status === 'done' || status === 'needs_input') w.info.acked = w.viewers.size > 0 && status === 'done';
-    else w.info.acked = true;
+    // Done, idle or asleep: it's not acting anything out any more.
+    if (status !== 'working' && status !== 'needs_input') w.info.action = undefined;
+    // Nobody is looking at the terminal right now -> raise the flag (the worker jumps). A worker at the
+    // meeting table that ends its part is waiting on the meeting, not on anyone, so it stays quiet.
+    if (status === 'done' || status === 'needs_input') {
+      w.info.acked = status === 'done' && (w.viewers.size > 0 || !!w.info.meeting);
+      w.info.waitingSince = Date.now();
+    } else w.info.acked = true;
     this.emitUpdate(w);
     // What a restarted office picks the worker back up as, should its terminal outlive this one.
     if (w.pty?.id) this.persist();
@@ -1191,9 +1296,11 @@ export class WorkerManager {
 
   private syncViewers(w: Worker): boolean {
     const names = [...new Set(w.viewers.values())];
-    const same = names.length === w.info.viewers.length && names.every((n, i) => n === w.info.viewers[i]);
-    if (same) return false;
+    const ids = [...w.viewers.keys()];
+    const same = (a: string[], b: string[]) => a.length === b.length && a.every((n, i) => n === b[i]);
+    if (same(names, w.info.viewers) && same(ids, w.info.viewerIds)) return false;
     w.info.viewers = names;
+    w.info.viewerIds = ids;
     return true;
   }
 
@@ -1305,6 +1412,7 @@ export class WorkerManager {
       ['PermissionRequest', undefined],
       ['PreToolUse', undefined],
       ['PostToolUse', undefined],
+      ['PostToolUseFailure', undefined],
     ];
     // Minimal VPS images sometimes lack curl; the office's own node binary is always there.
     const nodeHook = path.join(this.dataDir, 'hook.cjs');
@@ -1345,6 +1453,24 @@ process.stdin.on('end', () => {
     writeFileSync(this.settingsPath, JSON.stringify({ hooks }, null, 2), { mode: 0o600 });
   }
 
+  /**
+   * Writes the office-queue command into the data dir's bin/, running bin/office-queue.js with the
+   * office's own node, and returns that directory. Rewritten on every start, so after an upgrade it
+   * runs the new install's script.
+   */
+  private writeQueueCommand(): string | undefined {
+    const script = queueScript();
+    if (!script) return undefined;
+    const dir = path.join(this.dataDir, 'bin');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, 'office-queue');
+    writeFileSync(file, `#!/bin/sh\n# Agent Office's task queue, for the board agents (see bin/office-queue.js).\nexec ${shq(process.execPath)} ${shq(script)} "$@"\n`, { mode: 0o700 });
+    chmodSync(file, 0o700);
+    // cmd.exe and PowerShell find it by PATHEXT; Git Bash (Claude Code's shell there) runs the sh one.
+    if (WIN) writeFileSync(`${file}.cmd`, `@"${process.execPath}" "${script}" %*\r\n`);
+    return dir;
+  }
+
   private saveScrollback(w: Worker) {
     if (!w.term || !w.ser) return;
     w.unsaved = false;
@@ -1352,11 +1478,12 @@ process.stdin.on('end', () => {
   }
 
   private persist() {
-    const saved = [...this.workers.values()].map(({ info, tracker, codexTranscript, hookToken, pty }) => ({
+    const saved = [...this.workers.values()].map(({ info, tracker, codexTranscript, hookToken, pty, bootBlocked, interrupted }) => ({
       id: info.id,
       kind: info.kind,
       provider: info.provider,
       model: info.model,
+      effort: info.effort,
       deskId: info.deskId,
       name: info.name,
       color: info.color,
@@ -1369,12 +1496,15 @@ process.stdin.on('end', () => {
       activity: info.activity,
       task: info.task,
       pr: info.pr,
+      meeting: info.meeting,
       tracker: info.kind === 'agent' ? tracker : undefined,
       usage: info.provider === 'opencode' || info.provider === 'codex' || info.provider === 'cursor' ? info.usage : undefined,
       codexTranscript: info.provider === 'codex' ? codexTranscript : undefined,
       // A terminal still running in the host, to pick back up after a restart. Its hooks keep the token.
       hookToken,
-      pty: pty?.id ? { id: pty.id, status: info.status, acked: info.acked } : undefined,
+      pty: pty?.id ? { id: pty.id, status: info.status, acked: info.acked, waitingSince: info.waitingSince } : undefined,
+      // In the middle of something: if its terminal doesn't make it through a restart, it carries on after.
+      midTurn: !this.stopping && (!!interrupted || midTurn({ info, bootBlocked })),
     }));
     try {
       writeFileSync(this.statePath, JSON.stringify(saved, null, 2), { mode: 0o600 });
@@ -1386,7 +1516,7 @@ process.stdin.on('end', () => {
   private restore() {
     if (!existsSync(this.statePath)) return;
     try {
-      const saved = JSON.parse(readFileSync(this.statePath, 'utf8')) as (Partial<WorkerInfo> & { tracker?: unknown; codexTranscript?: unknown; hookToken?: unknown; pty?: any })[];
+      const saved = JSON.parse(readFileSync(this.statePath, 'utf8')) as (Partial<WorkerInfo> & { tracker?: unknown; codexTranscript?: unknown; hookToken?: unknown; pty?: any; midTurn?: unknown })[];
       for (const s of saved) {
         if (!s.id || !s.deskId || !DESK_BY_ID.has(s.deskId) || this.deskOccupied(s.deskId)) continue;
         const tracker = restoreTracker(s.tracker);
@@ -1402,6 +1532,7 @@ process.stdin.on('end', () => {
           kind: s.kind === 'shell' ? 'shell' : 'agent',
           provider,
           model: isValidModel(provider, s.model) ? s.model : undefined,
+          effort: provider === 'claude' && isAgentEffort(s.effort) ? s.effort : undefined,
           deskId: s.deskId,
           name: s.name ?? 'Worker',
           color: s.color ?? COLORS[0],
@@ -1420,14 +1551,19 @@ process.stdin.on('end', () => {
           cols: 100,
           rows: 30,
           viewers: [],
+          viewerIds: [],
+          meeting: typeof s.meeting === 'string' && DESK_BY_ID.get(s.deskId)?.room ? s.meeting : undefined,
         };
         const w = newWorker(info, tracker, typeof s.hookToken === 'string' && s.hookToken ? s.hookToken : undefined);
         if (provider === 'codex' && typeof s.codexTranscript === 'string') w.codexTranscript = s.codexTranscript;
         w.screenDirty = false;
         if (typeof s.pty?.id === 'string') {
           const status: WorkerStatus = RUNNING.has(s.pty.status) ? s.pty.status : 'idle';
-          w.saved = { ptyId: s.pty.id, status, acked: s.pty.acked !== false };
+          w.saved = { ptyId: s.pty.id, status, acked: s.pty.acked !== false, waitingSince: typeof s.pty.waitingSince === 'number' ? s.pty.waitingSince : undefined };
         }
+        // Mid-turn as the office went down: cut off, unless its terminal is picked back up still
+        // running (adopt). An office from before midTurn only said so for a terminal in the host.
+        w.interrupted = typeof s.midTurn === 'boolean' ? s.midTurn : s.pty?.status === 'working' || s.pty?.status === 'needs_input';
         if (info.prompt) w.prompts = [info.prompt.replace(/\s+/g, ' ').trim()];
         this.workers.set(info.id, w);
       }
@@ -1438,6 +1574,11 @@ process.stdin.on('end', () => {
 }
 
 // ---------------------------------------------------------------------------
+
+/** In the middle of a turn: working, or asking something (not stuck on a trust or login screen). */
+function midTurn({ info, bootBlocked }: Pick<Worker, 'info' | 'bootBlocked'>): boolean {
+  return info.kind === 'agent' && (info.status === 'working' || (info.status === 'needs_input' && !bootBlocked));
+}
 
 function newWorker(info: WorkerInfo, tracker: UsageTracker, hookToken = randomBytes(16).toString('hex')): Worker {
   return {
@@ -1452,6 +1593,7 @@ function newWorker(info: WorkerInfo, tracker: UsageTracker, hookToken = randomBy
     codexTools: new Map(),
     codexPending: new Set(),
     cursorTurns: [],
+    failStreak: 0,
     prompts: [],
     tools: [],
     toolsSinceNamed: 0,
@@ -1552,28 +1694,55 @@ function screenText(term: HeadlessTerminal, from = 0): string {
   return out.join('\n');
 }
 
+/** bin/office-queue.js in the install this office runs from (src/server under tsx, dist/server/server built). */
+function queueScript(): string | undefined {
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 4; i++, dir = path.dirname(dir)) {
+    const file = path.join(dir, 'bin', 'office-queue.js');
+    if (existsSync(file)) return file;
+  }
+  return undefined;
+}
+
+const WIN = process.platform === 'win32';
+
+/** The shell workers get when none is configured: $SHELL on Unix, cmd.exe on Windows. */
+export function defaultShell(): string {
+  return process.env.SHELL || (WIN ? process.env.COMSPEC || 'cmd.exe' : '/bin/bash');
+}
+
+/** How to have the default shell run one command line. */
+function shellRun(line: string): string[] {
+  return WIN && !process.env.SHELL ? ['/d', '/s', '/c', line] : ['-l', '-i', '-c', line];
+}
+
 export function resolveCommand(cmd: string): string | null {
-  if (cmd.includes('/')) {
-    try {
-      accessSync(cmd, constants.X_OK);
-      return path.resolve(cmd);
-    } catch {
-      return null;
+  // Windows runs files by extension: `claude` is really claude.exe / claude.cmd. An npm shim with
+  // no extension is a sh script the console can't run, so only take it when asked for by name.
+  const exts = WIN && !path.extname(cmd) ? (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean) : [''];
+  const usable = (p: string): string | null => {
+    for (const ext of exts) {
+      try {
+        accessSync(p + ext, constants.X_OK);
+        return p + ext;
+      } catch {
+        // keep looking
+      }
     }
+    return null;
+  };
+  if (cmd.includes('/') || (WIN && cmd.includes('\\'))) {
+    const found = usable(cmd);
+    return found && path.resolve(found);
   }
   for (const dir of (process.env.PATH || '').split(path.delimiter)) {
     if (!dir) continue;
-    const p = path.join(dir, cmd);
-    try {
-      accessSync(p, constants.X_OK);
-      return p;
-    } catch {
-      // keep looking
-    }
+    const found = usable(path.join(dir, cmd));
+    if (found) return found;
   }
+  if (WIN && !process.env.SHELL) return null;
   try {
-    const shell = process.env.SHELL || '/bin/bash';
-    const found = execFileSync(shell, ['-l', '-i', '-c', `command -v ${shq(cmd)}`], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
+    const found = execFileSync(defaultShell(), ['-l', '-i', '-c', `command -v ${shq(cmd)}`], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
       .trim()
       .split('\n')
       .pop();

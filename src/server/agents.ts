@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { AgentProvider } from '../shared/protocol.js';
+import { isAgentEffort, isClaudeModel, type AgentProvider } from '../shared/protocol.js';
 
 export const MODEL_MAX = 256;
 /** @deprecated The limit is the same for every provider; use MODEL_MAX. */
@@ -22,6 +22,11 @@ export function configuredProvider(command: string): AgentProvider {
 /** The CLI a provider runs when it isn't the configured --agent. Cursor's is not called `cursor`: that opens the editor. */
 export function providerCommand(provider: AgentProvider): string {
   return provider === 'cursor' ? 'cursor-agent' : provider;
+}
+
+/** The providers an office started with `configured` can hire: the four it knows, and a custom --agent only when that's what it was started with. */
+export function agentProviders(configured: AgentProvider): AgentProvider[] {
+  return configured === 'custom' ? ['claude', 'opencode', 'codex', 'cursor', 'custom'] : ['claude', 'opencode', 'codex', 'cursor'];
 }
 
 /**
@@ -84,4 +89,12 @@ export function withoutModelFlag(provider: AgentProvider, args: string[]): strin
     clean.push(arg);
   }
   return clean;
+}
+
+/** Claude Code's own `--effort` flag; no other provider this office launches supports one yet. */
+export function validateWorkerEffort(kind: 'agent' | 'shell', provider: AgentProvider | undefined, effort: unknown): string | undefined {
+  if (effort === undefined) return undefined;
+  if (kind === 'shell') return 'Shell workers do not have a reasoning effort';
+  if (provider !== 'claude') return 'Reasoning effort can only be selected for Claude Code workers';
+  return isAgentEffort(effort) ? undefined : 'Invalid effort (expected low, medium, high, xhigh or max)';
 }
