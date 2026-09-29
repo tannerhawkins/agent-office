@@ -26,11 +26,11 @@ export const EFFORT_LABEL: Record<AgentEffort, string> = {
   max: 'Max',
 };
 
-/** A short badge for the task card / sidebar: "Opus", "Opus · High", or the raw OpenCode model id. */
+/** A short badge for the task card / sidebar: "Opus", "Opus · High", or the raw model id. */
 export function modelBadge(provider: AgentProvider | undefined, model: string | undefined, effort: AgentEffort | undefined): string | undefined {
   if (!model && !effort) return undefined;
   if (provider === 'claude') {
-    const label = model && model in CLAUDE_MODEL_LABEL ? CLAUDE_MODEL_LABEL[model as ClaudeModel] : undefined;
+    const label = model && model in CLAUDE_MODEL_LABEL ? CLAUDE_MODEL_LABEL[model as ClaudeModel] : model;
     const parts = [label, effort ? EFFORT_LABEL[effort] : undefined].filter((v): v is string => !!v);
     return parts.length ? parts.join(' · ') : undefined;
   }
@@ -104,11 +104,11 @@ export function choiceLabel(choice: AgentChoice): string {
 export interface ProviderPicker {
   element: HTMLElement;
   value(): AgentProvider;
-  /** The optional initial model override: an OpenCode provider/model id, or a Claude model alias. */
+  /** The optional model override for the selected provider: a Claude alias, or a model id the provider takes. */
   model(): string | undefined;
   /** The optional Claude reasoning effort. */
   effort(): AgentEffort | undefined;
-  /** Reports a visible field error for an invalid nonempty OpenCode model. */
+  /** Reports a visible field error for an invalid nonempty model. */
   valid(): boolean;
 }
 
@@ -120,32 +120,43 @@ export interface AgentFields extends ProviderPicker {
 }
 
 const MODEL_MAX = 256;
-let modelList: string[] | null = null;
-let modelListAt = 0;
-let modelRequest: Promise<string[]> | null = null;
+/** Providers picked by typing a model id (Claude picks from its aliases instead); the server's agents.ts MODEL_FLAGS. */
+const TYPED_MODEL_PROVIDERS: AgentProvider[] = ['opencode', 'codex', 'cursor'];
+const MODEL_EXAMPLE: Partial<Record<AgentProvider, string>> = {
+  opencode: 'provider/model',
+  codex: 'e.g. gpt-5-codex',
+  cursor: 'e.g. auto',
+};
+const modelLists = new Map<AgentProvider, { models: string[]; at: number }>();
+const modelRequests = new Map<AgentProvider, Promise<string[]>>();
 
-function validModel(value: string): boolean {
+/** Mirrors the server's isValidModel: argv-safe ids, and OpenCode's are provider/model. */
+function validModel(provider: AgentProvider, value: string): boolean {
   if (value.length === 0 || value.length > MODEL_MAX || /[\s\p{Cc}\p{Cf}]/u.test(value)) return false;
+  if (provider !== 'opencode') return !value.startsWith('-');
   const parts = value.split('/');
   return parts.length >= 2 && /^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/.test(parts[0]) && parts.slice(1).every((part) => part.length > 0);
 }
 
-function fetchOpenCodeModels(): Promise<string[]> {
-  if (modelList && Date.now() - modelListAt < 60_000) return Promise.resolve(modelList);
-  if (modelRequest) return modelRequest;
-  modelRequest = fetch('/api/agents/opencode/models', { credentials: 'same-origin', cache: 'no-store' })
+function fetchModels(provider: AgentProvider): Promise<string[]> {
+  const cached = modelLists.get(provider);
+  if (cached && Date.now() - cached.at < 60_000) return Promise.resolve(cached.models);
+  const pending = modelRequests.get(provider);
+  if (pending) return pending;
+  const request = fetch(`/api/agents/${provider}/models`, { credentials: 'same-origin', cache: 'no-store' })
     .then(async (res) => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { models?: unknown };
-      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validModel(m)) : [];
-      modelList = [...new Set(models)];
-      modelListAt = Date.now();
-      return modelList;
+      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validModel(provider, m)) : [];
+      const list = [...new Set(models)];
+      modelLists.set(provider, { models: list, at: Date.now() });
+      return list;
     })
     .finally(() => {
-      modelRequest = null;
+      modelRequests.delete(provider);
     });
-  return modelRequest;
+  modelRequests.set(provider, request);
+  return request;
 }
 
 /**
@@ -162,14 +173,13 @@ export function agentFields(project: ProjectInfo | null, id: string, initial: Ag
     type: 'text',
     id: `${id}-model`,
     list: `${id}-models`,
-    placeholder: 'Default (OpenCode settings)',
-    'aria-label': 'OpenCode model',
     autocomplete: 'off',
     maxlength: MODEL_MAX,
   }) as HTMLInputElement;
-  const modelHint = h('small.provider-model-hint', {}, 'Optional provider/model override; suggestions load when OpenCode is selected.');
+  const modelHint = h('small.provider-model-hint');
   const modelListEl = h('datalist', { id: `${id}-models` });
-  const modelChoice = h('div.provider-model', {}, h('label', { for: `${id}-model` }, 'OpenCode model'), modelInput, modelListEl, modelHint);
+  const modelLabel = h('label', { for: `${id}-model` });
+  const modelChoice = h('div.provider-model', {}, modelLabel, modelInput, modelListEl, modelHint);
 
   const claudeModelSelect = h('select', { id: `${id}-claude-model`, 'aria-label': 'Claude model' }) as HTMLSelectElement;
   claudeModelSelect.append(h('option', { value: '' }, 'Default (--agent-args)'));
@@ -188,47 +198,68 @@ export function agentFields(project: ProjectInfo | null, id: string, initial: Ag
   );
 
   const element = h('div.provider-choice', {}, h('label', { for: id }, label), select, note, modelChoice, claudeChoice);
-  /** OpenCode's model suggestions, asked for only once someone can see the field. */
+  const selected = () => select.value as AgentProvider;
+  const typed = () => TYPED_MODEL_PROVIDERS.includes(selected());
+  /** The selected provider's model suggestions, asked for only once someone can see the field. */
   const loadModels = () => {
-    if (select.value !== 'opencode' || !element.isConnected || element.closest('.hidden')) return;
-    modelHint.textContent = modelList ? 'Optional provider/model override; choose a suggestion or enter one manually.' : 'Loading OpenCode models… You can enter a provider/model manually.';
-    void fetchOpenCodeModels()
+    const provider = selected();
+    if (!TYPED_MODEL_PROVIDERS.includes(provider) || !element.isConnected || element.closest('.hidden')) return;
+    const manual = `Optional; type a model id (${MODEL_EXAMPLE[provider]}).`;
+    modelHint.textContent = modelLists.has(provider) ? manual : `Loading ${PROVIDER_LABEL[provider]} models… ${manual}`;
+    void fetchModels(provider)
       .then((models) => {
+        if (selected() !== provider) return;
         modelListEl.replaceChildren(...models.map((model) => h('option', { value: model })));
-        modelHint.textContent = 'Optional provider/model override; choose a suggestion or enter one manually.';
+        modelHint.textContent = models.length ? 'Optional; choose a suggestion or type a model id.' : manual;
       })
       .catch(() => {
-        modelHint.textContent = 'Model suggestions unavailable; enter a provider/model manually if needed.';
+        if (selected() === provider) modelHint.textContent = `Model suggestions unavailable. ${manual}`;
       });
   };
   const setModelVisibility = (provider: AgentProvider) => {
-    const openCode = provider === 'opencode';
+    const picks = TYPED_MODEL_PROVIDERS.includes(provider);
     note.textContent = providerUsageNote(provider);
-    modelChoice.classList.toggle('hidden', !openCode);
-    modelInput.disabled = !openCode;
+    modelChoice.classList.toggle('hidden', !picks);
+    modelInput.disabled = !picks;
     claudeChoice.classList.toggle('hidden', provider !== 'claude');
+    if (picks) {
+      const name = PROVIDER_LABEL[provider];
+      modelLabel.textContent = `${name} model`;
+      modelInput.placeholder = `Default (${name} settings)`;
+      modelInput.setAttribute('aria-label', `${name} model`);
+      modelHint.textContent = `Optional; type a model id (${MODEL_EXAMPLE[provider]}).`;
+    }
     loadModels();
   };
   const set = (c: AgentChoice) => {
     select.value = options.includes(c.provider) ? c.provider : options.includes(fallback) ? fallback : options[0];
     const claude = select.value === 'claude';
-    claudeModelSelect.value = claude && c.model && (CLAUDE_MODELS as readonly string[]).includes(c.model) ? c.model : '';
+    // A full Claude model id (set in ⚙️ Settings, say) gets an option of its own.
+    if (claude && c.model && ![...claudeModelSelect.options].some((o) => o.value === c.model)) claudeModelSelect.append(h('option', { value: c.model }, c.model));
+    claudeModelSelect.value = claude && c.model ? c.model : '';
     effortSelect.value = claude && c.effort ? c.effort : '';
-    modelInput.value = select.value === 'opencode' && c.model ? c.model : '';
+    modelInput.value = TYPED_MODEL_PROVIDERS.includes(select.value as AgentProvider) && c.model ? c.model : '';
     modelInput.setCustomValidity('');
-    setModelVisibility(select.value as AgentProvider);
+    modelListEl.replaceChildren();
+    setModelVisibility(selected());
   };
   set(initial);
-  select.addEventListener('change', () => setModelVisibility(select.value as AgentProvider));
+  select.addEventListener('change', () => {
+    // A model belongs to one provider, so switching starts the choice over.
+    modelInput.value = '';
+    modelInput.setCustomValidity('');
+    modelListEl.replaceChildren();
+    setModelVisibility(selected());
+  });
   modelInput.addEventListener('focus', loadModels);
   modelInput.addEventListener('input', () => modelInput.setCustomValidity(''));
-  const value = () => (options.includes(select.value as AgentProvider) ? (select.value as AgentProvider) : fallback);
+  const value = () => (options.includes(selected()) ? selected() : fallback);
   const effort = () => (select.value === 'claude' && effortSelect.value ? (effortSelect.value as AgentEffort) : undefined);
   const model = () => {
     if (select.value === 'claude') return claudeModelSelect.value || undefined;
-    if (select.value !== 'opencode') return undefined;
-    const v = modelInput.value;
-    return validModel(v) ? v : undefined;
+    if (!typed()) return undefined;
+    const v = modelInput.value.trim();
+    return validModel(selected(), v) ? v : undefined;
   };
   return {
     element,
@@ -238,12 +269,14 @@ export function agentFields(project: ProjectInfo | null, id: string, initial: Ag
     set,
     choice: () => ({ provider: value(), ...(model() ? { model: model() } : {}), ...(effort() ? { effort: effort() } : {}) }),
     valid: () => {
-      if (select.value !== 'opencode' || !modelInput.value) {
+      const v = modelInput.value.trim();
+      if (!typed() || !v) {
         modelInput.setCustomValidity('');
         return true;
       }
-      const okay = validModel(modelInput.value);
-      modelInput.setCustomValidity(okay ? '' : 'Use provider/model format without whitespace or control characters (up to 256 characters).');
+      const okay = validModel(selected(), v);
+      const format = selected() === 'opencode' ? 'Use provider/model format without whitespace or control characters' : 'Use a model id without whitespace or control characters that does not start with "-"';
+      modelInput.setCustomValidity(okay ? '' : `${format} (up to 256 characters).`);
       if (!okay) modelInput.reportValidity();
       return okay;
     },

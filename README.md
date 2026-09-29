@@ -193,7 +193,7 @@ agent-office accounts [list | invite [name] [--admin] | revoke <name> | role <na
 
 Every new worker starts on the office's **Default worker**: a provider, model and effort an admin picks in ⚙️ Settings (the `--agent` with its own default model until someone does). The hire, ask, queue, issue and meeting windows show it on one line; click **✏️ Edit** there to pick **Claude Code**, **OpenCode**, **Codex** or **Cursor**, a model and an effort for just that worker or task, and **↺ Use the default** to go back. Board agents and tasks the Queue agent adds, which nobody picks for, start on the default too. Existing workers keep their provider when prompted or resumed, and queued tasks keep their choice when retried or restored after a restart.
 
-For OpenCode, the optional **OpenCode model** field selects the initial model for a new worker or queue task. Suggestions come from `opencode models`; you can also enter a `provider/model` ID. Leave it empty to use your OpenCode settings (including configured CLI arguments). An explicit choice overrides configured model arguments for that launch and stays with a queued task when retried.
+Claude Code, OpenCode, Codex and Cursor workers and queue tasks can each be given a model: the optional **model** field under the provider picks one for that worker or task alone. Suggestions come from `opencode models` and `cursor-agent models` (cached for a minute); Claude gets its aliases (`opus`, `sonnet`, `haiku`, `fable`), and Codex takes whatever ID you type. OpenCode IDs are `provider/model`; Cursor's parameterized models keep their brackets (`claude-opus-4-8[effort=high]`). Leave it empty to use the provider's own settings (including configured CLI arguments). A choice replaces any model in `--agent-args` for that worker, stays with a queued task when it is retried or the office restarts, and shows next to the worker's provider. Claude, Codex and Cursor workers get it again every time they resume, so a restart doesn't put them back on the default model; OpenCode sessions restore their own model, so it only gets one on the first launch.
 
 For Claude Code, the **Model** and **Effort** fields pick `--model` (Fable, Opus, Sonnet or Haiku) and `--effort` (low, medium, high, extra high or max) for that worker or queue task, overriding whatever `--agent-args` set office-wide. Leave either on **Default** to use the office's configured value. The choice stays with a worker across resumes and with a queued task when retried, and shows up next to the worker in the Workers panel and on its task card so you can tell at a glance who's on what — and the per-worker cost there reflects the actual model used.
 
@@ -205,7 +205,7 @@ Claude Code remains the default. To default to OpenCode:
 agent-office /path/to/project --agent opencode
 ```
 
-`--agent-args` applies only to the provider configured by `--agent`; choosing another provider uses its normal command and settings. OpenCode model flags therefore never reach Claude Code, and vice versa. An arbitrary `--agent` executable remains available as **Custom**.
+`--agent-args` applies only to the provider configured by `--agent`; choosing another provider uses its normal command and settings. Model flags there therefore never reach another provider. An arbitrary `--agent` executable remains available as **Custom**.
 
 ## The office's prompts
 

@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { isAgentEffort, isAgentProvider, isClaudeModel, type AgentChoice, type AgentEffort, type AgentProvider, type GhPull, type QueueState, type QueueTask, type WorkerInfo, type WorkerStatus } from '../shared/protocol.js';
 import { DESK_BY_ID, SEATS, nextFreeSeat } from '../shared/layout.js';
-import { isValidOpenCodeModel, validateWorkerEffort, validateWorkerModel } from './agents.js';
+import { isValidModel, validateWorkerEffort, validateWorkerModel } from './agents.js';
 import { PROMPTS } from '../shared/prompts.js';
 import type { BranchTask } from './workers.js';
 
@@ -95,7 +95,7 @@ export class TaskQueue {
     const task: QueueTask = {
       id: randomBytes(6).toString('hex'),
       provider,
-      model: provider === 'opencode' || provider === 'claude' ? model : undefined,
+      model: isValidModel(provider, model) ? model : undefined,
       effort: provider === 'claude' ? effort : undefined,
       issue,
       title: (title?.trim() || firstLine(clean)).slice(0, 120),
@@ -366,7 +366,7 @@ export class TaskQueue {
         const t: QueueTask = {
           id: s.id,
           provider,
-          model: provider === 'opencode' && isValidOpenCodeModel(s.model) ? s.model : provider === 'claude' && isClaudeModel(s.model) ? s.model : undefined,
+          model: isValidModel(provider, s.model) ? s.model : undefined,
           effort: provider === 'claude' && isAgentEffort(s.effort) ? s.effort : undefined,
           issue: typeof s.issue === 'number' ? s.issue : undefined,
           title: s.title,

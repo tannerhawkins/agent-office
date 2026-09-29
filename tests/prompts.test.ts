@@ -82,7 +82,7 @@ test('the default worker is checked before it is kept, and one the office can no
   const book = new OfficePrompts(dir, { list: ['claude', 'opencode', 'codex'], configured: 'claude' }, () => {});
   assert.equal(book.agent(), undefined);
   assert.match(book.setAgent({ provider: 'custom' }, 'Ada') ?? '', /Unknown agent provider/);
-  assert.match(book.setAgent({ provider: 'claude', model: 'gpt-9' }, 'Ada') ?? '', /Invalid Claude model/);
+  assert.match(book.setAgent({ provider: 'claude', model: '--gpt-9' }, 'Ada') ?? '', /Invalid model/);
   assert.match(book.setAgent({ provider: 'codex', effort: 'high' }, 'Ada') ?? '', /only be selected for Claude/);
   assert.match(book.setAgent({ provider: 'opencode', model: 'no slash' }, 'Ada') ?? '', /Invalid OpenCode model/);
   assert.equal(book.setAgent({ provider: 'claude', model: 'opus', effort: 'high' }, 'Ada'), undefined);

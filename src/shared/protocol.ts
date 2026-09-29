@@ -81,7 +81,7 @@ export interface WorkerInfo {
   /** 'agent' runs the selected provider; 'shell' is a plain shared login shell. */
   kind: WorkerKind;
   provider?: AgentProvider;
-  /** Model requested for this worker, instead of the office's configured default: an OpenCode provider/model id, or a Claude model alias. */
+  /** The model picked for this worker, when one was; unset runs the provider's default. */
   model?: string;
   /** Reasoning effort requested for this worker, when one was chosen (Claude only). */
   effort?: AgentEffort;
@@ -324,7 +324,7 @@ export type TaskStatus = 'queued' | 'running' | 'done';
 export interface QueueTask {
   id: string;
   provider?: AgentProvider;
-  /** Model requested for this task, instead of the office's configured default: an OpenCode provider/model id, or a Claude model alias. */
+  /** The model picked for this task's worker, when one was; unset runs the provider's default. */
   model?: string;
   /** Reasoning effort requested for this task, when one was chosen (Claude only). */
   effort?: AgentEffort;
