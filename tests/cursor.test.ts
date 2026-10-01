@@ -22,8 +22,8 @@ import { configuredProvider, providerCommand } from '../src/server/agents.js';
 test('cursor-agent is its own provider and runs as cursor-agent, never the editor', () => {
   assert.equal(configuredProvider('/Users/me/.local/bin/cursor-agent'), 'cursor');
   assert.equal(configuredProvider('cursor'), 'custom');
-  assert.equal(providerCommand('cursor'), 'cursor-agent');
-  assert.equal(providerCommand('codex'), 'codex');
+  assert.equal(providerCommand('cursor', 'claude'), 'cursor-agent');
+  assert.equal(providerCommand('codex', 'claude'), 'codex');
 });
 
 test('Cursor hooks are bounded to known events and a conversation id', () => {

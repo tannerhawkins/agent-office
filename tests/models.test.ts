@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isValidModel, isValidOpenCodeModel, withoutModelFlag } from '../src/server/agents.js';
-import { createOpenCodeModelCatalogue, fetchCursorModels, fetchOpenCodeModels, type ModelCommandRunner } from '../src/server/models.js';
+import { isValidGrokModel, isValidMuseModel, isValidOpenCodeModel } from '../src/shared/providers.js';
+import { createGrokModelCatalogue, createOpenCodeModelCatalogue, fetchCursorModels, fetchGrokModels, fetchOpenCodeModels, type ModelCommandRunner } from '../src/server/models.js';
 
 test('OpenCode model ids require provider/model and reject whitespace or control characters', () => {
   assert.equal(isValidOpenCodeModel('openai/gpt-5'), true);
@@ -47,6 +47,58 @@ test('OpenCode catalogue coalesces requests and caches successful results briefl
   assert.equal(calls, 2);
 });
 
+test('Grok model ids are argv-safe tokens without a provider prefix', () => {
+  assert.equal(isValidGrokModel('grok-4.6'), true);
+  assert.equal(isValidGrokModel('grok-4.7-build-fast'), true);
+  assert.equal(isValidGrokModel('openai/gpt-5'), false);
+  assert.equal(isValidGrokModel('grok 4.6'), false);
+  assert.equal(isValidGrokModel('x'.repeat(65)), false);
+});
+
+test('Muse model ids are argv-safe tokens without a provider prefix', () => {
+  assert.equal(isValidMuseModel('muse-spark-1.3-contributor'), true);
+  assert.equal(isValidMuseModel('openai/gpt-5'), false);
+  assert.equal(isValidMuseModel('muse spark'), false);
+  assert.equal(isValidMuseModel('x'.repeat(129)), false);
+});
+
+test('Grok catalogue parses `grok models` lines and ignores login chrome', async () => {
+  let call: { file: string; args: string[]; options: Record<string, unknown> } | undefined;
+  const runner: ModelCommandRunner = async (file, args, options) => {
+    call = { file, args, options };
+    return {
+      stdout: 'You are logged in with grok.com.\n\nDefault model: grok-4.6\n\nAvailable models:\n  - grok-4.7\n  * grok-4.6 (default)\n  - grok-4.5\n',
+      stderr: 'private detail',
+    };
+  };
+  assert.deepEqual(await fetchGrokModels('/custom/grok', '/project', runner), ['grok-4.7', 'grok-4.6', 'grok-4.5']);
+  assert.deepEqual(call, {
+    file: '/custom/grok',
+    args: ['models'],
+    options: { cwd: '/project', timeout: 10_000, maxBuffer: 1024 * 1024 },
+  });
+});
+
+test('Grok catalogue coalesces requests and caches successful results briefly', async () => {
+  let calls = 0;
+  let now = 1000;
+  const runner: ModelCommandRunner = async () => {
+    calls++;
+    return { stdout: '  - grok-4.6\n', stderr: '' };
+  };
+  const catalogue = createGrokModelCatalogue('/grok', '/project', runner, () => now);
+  const [a, b] = await Promise.all([catalogue.get(), catalogue.get()]);
+  assert.deepEqual(a, ['grok-4.6']);
+  assert.deepEqual(b, a);
+  assert.equal(calls, 1);
+  now += 59_999;
+  await catalogue.get();
+  assert.equal(calls, 1);
+  now += 2;
+  await catalogue.get();
+  assert.equal(calls, 2);
+});
+
 test('OpenCode catalogue errors do not expose command output', async () => {
   const runner: ModelCommandRunner = async () => {
     throw new Error('secret-token from stderr');
@@ -55,27 +107,6 @@ test('OpenCode catalogue errors do not expose command output', async () => {
   await assert.rejects(createOpenCodeModelCatalogue('opencode', '/project', runner).get(), (error: unknown) => {
     return error instanceof Error && /unavailable/i.test(error.message) && !error.message.includes('secret-token');
   });
-});
-
-test('model ids for other providers are argv-safe and keep Cursor parameter brackets', () => {
-  assert.equal(isValidModel('claude', 'opus'), true);
-  assert.equal(isValidModel('claude', 'claude-opus-5-5'), true);
-  assert.equal(isValidModel('cursor', "claude-opus-4-8[context=1m,effort=high]"), true);
-  assert.equal(isValidModel('codex', 'gpt-5-codex'), true);
-  assert.equal(isValidModel('claude', '--dangerously-skip-permissions'), false);
-  assert.equal(isValidModel('cursor', 'gpt 5'), false);
-  assert.equal(isValidModel('codex', ''), false);
-  assert.equal(isValidModel('custom', 'anything'), false);
-  assert.equal(isValidModel(undefined, 'opus'), false);
-  assert.equal(isValidModel('opencode', 'gpt-5'), false);
-});
-
-test('model flags from --agent-args are removed in every form the provider understands', () => {
-  const args = ['--model', 'a', '--keep', '--model=b', '-m', 'c', '-md', '--mode', 'plan'];
-  assert.deepEqual(withoutModelFlag('codex', args), ['--keep', '--mode', 'plan']);
-  // Claude and Cursor have no -m, so it isn't theirs to remove.
-  assert.deepEqual(withoutModelFlag('cursor', args), ['--keep', '-m', 'c', '-md', '--mode', 'plan']);
-  assert.deepEqual(withoutModelFlag('custom', args), args);
 });
 
 test('Cursor catalogue reads the ids from `cursor-agent models` and skips the header and tip', async () => {

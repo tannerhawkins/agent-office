@@ -1,3 +1,4 @@
+import './search.css';
 import type { ChatLine, SearchResults, TerminalHit } from '../../shared/protocol';
 import { SEARCH_MAX, SEARCH_MIN, searchKey } from '../../shared/search';
 import { store } from '../state';
@@ -173,7 +174,7 @@ export function openSearch(openTerminal: (workerId: string, find: TerminalFind) 
     (next ?? (e.key === 'ArrowUp' ? input : at)).focus();
   });
 
-  const modal = openModal(el, { onClose: () => clearTimeout(timer) });
+  const modal = openModal(el, { doing: '🔎 searching the office', onClose: () => clearTimeout(timer) });
   close.addEventListener('click', () => modal.close());
   render();
   void run();

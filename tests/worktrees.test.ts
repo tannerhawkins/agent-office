@@ -1,156 +1,165 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { BRANCHES_FILE, Worktrees } from '../src/server/worktrees.js';
-import { Building } from '../src/server/building.js';
+import { Changes } from '../src/server/changes.js';
+import { Worktrees } from '../src/server/worktrees.js';
 
-/** A project checkout with one commit and the office's folder in it. */
-function repo(): { dir: string; git(...args: string[]): string; close(): void } {
-  const dir = mkdtempSync(path.join(tmpdir(), 'office-worktrees-'));
-  const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, encoding: 'utf8' }).trim();
-  git('init', '-q', '-b', 'main');
-  git('commit', '-q', '--allow-empty', '-m', 'start');
-  mkdirSync(path.join(dir, '.agent-office'));
-  return { dir, git, close: () => rmSync(dir, { recursive: true, force: true }) };
+/**
+ * A project cloned from a bare origin, plus a second clone standing in for GitHub: whatever it
+ * pushes is a pull request merged there, which the project hasn't pulled (issue #119).
+ */
+function fixture(t: { after(fn: () => void): void }) {
+  const root = mkdtempSync(path.join(tmpdir(), 'office-worktrees-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const run = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const origin = path.join(root, 'origin.git');
+  run(root, 'init', '-q', '--bare', '-b', 'main', origin);
+  const dir = path.join(root, 'project');
+  run(root, 'clone', '-q', origin, dir);
+  run(dir, 'checkout', '-q', '-b', 'main');
+  writeFileSync(path.join(dir, 'a.txt'), 'a');
+  run(dir, 'add', '.');
+  run(dir, 'commit', '-qm', 'a');
+  run(dir, 'push', '-q', '-u', 'origin', 'main');
+  const github = path.join(root, 'github');
+  run(root, 'clone', '-q', origin, github);
+  const commit = (cwd: string, file: string) => {
+    writeFileSync(path.join(cwd, file), file);
+    run(cwd, 'add', '.');
+    run(cwd, 'commit', '-qm', file);
+    return run(cwd, 'rev-parse', 'HEAD');
+  };
+  const merge = (file: string) => {
+    run(github, 'pull', '-q', '--ff-only');
+    const sha = commit(github, file);
+    run(github, 'push', '-q', 'origin', 'main');
+    return sha;
+  };
+  return { root, dir, git: (...args: string[]) => run(dir, ...args), commit: (file: string) => commit(dir, file), merge };
 }
 
-test('a worktree gets the branch it was asked for, recorded as the office\'s', (t) => {
-  const r = repo();
-  t.after(r.close);
-  const trees = new Worktrees(r.dir);
-  const made = trees.create('pixel-a1b2', 'feat/12-fix-login');
-  assert.equal(typeof made, 'object');
-  if (typeof made === 'string') return;
-  assert.equal(made.branch, 'feat/12-fix-login');
-  assert.equal(made.path, path.join('.agent-office', 'worktrees', 'pixel-a1b2'));
+test("a worktree starts from the PR merged on origin, not from the project's stale checkout", async (t) => {
+  const f = fixture(t);
+  const stale = f.git('rev-parse', 'HEAD');
+  const merged = f.merge('fix.txt');
+  const trees = new Worktrees(f.dir);
+  // Nothing fetched it yet: the project's main and its origin/main both still say `stale`.
+  assert.equal(f.git('rev-parse', 'origin/main'), stale);
+  const fetching = trees.fetch();
+  assert.ok(fetching, 'fetches the first time');
+  await fetching;
+  assert.equal(f.git('rev-parse', 'origin/main'), merged);
+  // A burst of hires shares that fetch.
+  assert.equal(trees.fetch(), undefined);
+  const made = trees.create('rex-1');
+  assert.ok(typeof made !== 'string', String(made));
+  assert.equal(made.base, merged);
   assert.equal(made.from, 'main');
-  assert.deepEqual(JSON.parse(readFileSync(path.join(r.dir, BRANCHES_FILE), 'utf8')), ['feat/12-fix-login']);
+  assert.equal(made.note, undefined);
+  assert.ok(existsSync(path.join(f.dir, made.path, 'fix.txt')), 'the worktree has the merged fix');
+  // The project's own checkout is left where it was.
+  assert.equal(f.git('rev-parse', 'HEAD'), stale);
 });
 
-test('a name that is taken, here or on origin, gets -2, -3', (t) => {
-  const r = repo();
-  t.after(r.close);
-  r.git('branch', 'feat/fix');
-  r.git('update-ref', 'refs/remotes/origin/feat/fix-2', 'HEAD');
-  const made = new Worktrees(r.dir).create('pixel-a1b2', 'feat/fix');
-  assert.equal(typeof made === 'object' && made.branch, 'feat/fix-3');
+test('a project ahead of origin (commits not pushed yet) still branches from its HEAD', async (t) => {
+  const f = fixture(t);
+  const local = f.commit('wip.txt');
+  const trees = new Worktrees(f.dir);
+  await trees.fetch();
+  const made = trees.create('rex-2');
+  assert.ok(typeof made !== 'string', String(made));
+  assert.equal(made.base, local);
+  assert.equal(made.note, undefined);
 });
 
-test('cleanup lists only the office\'s branches, and forgets the ones it deletes', async (t) => {
-  const r = repo();
-  t.after(r.close);
-  const trees = new Worktrees(r.dir);
-  r.git('branch', 'feat/mine');
-  r.git('branch', 'office/old-worker-ab12');
-  const made = trees.create('pixel-a1b2', 'feat/theirs');
-  if (typeof made === 'string') return assert.fail(made);
-  const { branches } = await trees.list();
-  assert.deepEqual(branches.sort(), ['feat/theirs', 'office/old-worker-ab12']);
-
-  assert.equal(await trees.remove(made, 'all'), undefined);
-  assert.deepEqual([...trees.recorded()], []);
-  assert.deepEqual((await trees.list()).branches, ['office/old-worker-ab12']);
+test("when both moved on, it starts from origin's and says what it left out", async (t) => {
+  const f = fixture(t);
+  const merged = f.merge('fix.txt');
+  f.commit('wip1.txt');
+  f.commit('wip2.txt');
+  const trees = new Worktrees(f.dir);
+  await trees.fetch();
+  const made = trees.create('rex-3');
+  assert.ok(typeof made !== 'string', String(made));
+  assert.equal(made.base, merged);
+  assert.match(made.note ?? '', /origin\/main.*2 commits on main/);
 });
 
-test('a recorded branch deleted by hand is forgotten, so a later one by that name is yours', async (t) => {
-  const r = repo();
-  t.after(r.close);
-  const trees = new Worktrees(r.dir);
-  const made = trees.create('pixel-a1b2', 'feat/x');
-  if (typeof made === 'string') return assert.fail(made);
-  r.git('worktree', 'remove', '--force', made.path);
-  r.git('branch', '-D', 'feat/x');
-  await trees.list();
-  assert.deepEqual([...trees.recorded()], []);
+test('without an origin, or offline, it branches from HEAD as before', async (t) => {
+  const f = fixture(t);
+  f.merge('fix.txt');
+  f.git('remote', 'set-url', 'origin', path.join(f.root, 'nowhere.git'));
+  const trees = new Worktrees(f.dir);
+  await trees.fetch();
+  const made = trees.create('rex-4');
+  assert.ok(typeof made !== 'string', String(made));
+  assert.equal(made.base, f.git('rev-parse', 'HEAD'));
+  f.git('remote', 'remove', 'origin');
+  const again = new Worktrees(f.dir);
+  assert.equal(again.fetch(), undefined, 'nothing to fetch from');
+  const other = again.create('rex-5');
+  assert.ok(typeof other !== 'string', String(other));
+  assert.equal(other.base, f.git('rev-parse', 'HEAD'));
 });
 
-test('a floor keeps its branch template, and turns bad ones away', (t) => {
-  const home = mkdtempSync(path.join(tmpdir(), 'office-building-'));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
-  const project = path.join(home, 'project');
-  mkdirSync(project);
-  const building = new Building(home, home);
-  const def = building.ensureLocal(project, 'sam');
-  assert.equal(def.branchTemplate, undefined);
-
-  assert.match(building.setBranchTemplate(def.id, 'feat/{ticket}')!, /ticket/);
-  assert.equal(building.setBranchTemplate(def.id, ' feat/{issue}-{slug} '), undefined);
-  assert.equal(new Building(home, home).list()[0].branchTemplate, 'feat/{issue}-{slug}');
-
-  assert.equal(building.setBranchTemplate(def.id, ''), undefined);
-  assert.equal(new Building(home, home).list()[0].branchTemplate, undefined);
-
-  // One edited by hand into something git won't take is dropped on load.
-  const file = path.join(home, 'floors.json');
-  const saved = JSON.parse(readFileSync(file, 'utf8'));
-  saved[0].branchTemplate = 'feat {slug}';
-  writeFileSync(file, JSON.stringify(saved));
-  assert.equal(new Building(home, home).list()[0].branchTemplate, undefined);
+test('on a detached HEAD there is no branch to fetch', (t) => {
+  const f = fixture(t);
+  f.git('checkout', '-q', '--detach');
+  const trees = new Worktrees(f.dir);
+  assert.equal(trees.fetch(), undefined);
+  const made = trees.create('rex-6');
+  assert.ok(typeof made !== 'string', String(made));
+  assert.equal(made.base, f.git('rev-parse', 'HEAD'));
+  assert.equal(made.from, undefined);
 });
 
-test('a new worktree gets the gitignored files .worktreeinclude names, and nothing else', (t) => {
-  const r = repo();
-  t.after(r.close);
-  writeFileSync(path.join(r.dir, '.gitignore'), '.env\n*.local\nsecret.txt\n.agent-office/\n');
-  writeFileSync(path.join(r.dir, '.worktreeinclude'), '.env\nconfig/*.local\nnotes.md\n');
-  r.git('add', '.gitignore', '.worktreeinclude');
-  r.git('commit', '-q', '-m', 'ignore');
-  mkdirSync(path.join(r.dir, 'config'));
-  writeFileSync(path.join(r.dir, '.env'), 'KEY=1\n');
-  writeFileSync(path.join(r.dir, 'config', 'db.local'), 'db\n');
-  writeFileSync(path.join(r.dir, 'secret.txt'), 'not included\n');
-  writeFileSync(path.join(r.dir, 'notes.md'), 'included but not ignored\n');
-  const made = new Worktrees(r.dir).create('pixel-a1b2', 'feat/env');
-  if (typeof made === 'string') return assert.fail(made);
-  const wt = path.join(r.dir, made.path);
-  assert.equal(readFileSync(path.join(wt, '.env'), 'utf8'), 'KEY=1\n');
-  assert.equal(readFileSync(path.join(wt, 'config', 'db.local'), 'utf8'), 'db\n');
-  assert.equal(existsSync(path.join(wt, 'secret.txt')), false);
-  assert.equal(existsSync(path.join(wt, 'notes.md')), false);
+test("the Changes window doesn't count PRs merged on origin as the worker's changes", async (t) => {
+  const f = fixture(t);
+  f.merge('fix.txt');
+  const trees = new Worktrees(f.dir);
+  await trees.fetch();
+  const made = trees.create('rex-7');
+  assert.ok(typeof made !== 'string', String(made));
+  const cwd = path.join(f.dir, made.path);
+  writeFileSync(path.join(cwd, 'mine.txt'), 'mine');
+  execFileSync('git', ['add', 'mine.txt'], { cwd });
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'mine'], { cwd });
+  const target = { name: 'Rex', cwd, rel: made.path, worktreeBase: made.base };
+  const changes = new Changes(f.dir, 'main', () => target, () => undefined, { state() {}, toast() {}, refreshGitHub() {} });
+  t.after(() => changes.stop());
+  const state = await (changes as unknown as { compute(id: string, t: typeof target): Promise<{ files: { path: string }[]; ahead: number; error?: string }> }).compute('w1', target);
+  assert.equal(state.error, undefined);
+  assert.deepEqual(state.files.map((x) => x.path), ['mine.txt']);
+  assert.equal(state.ahead, 1);
 });
 
-test("Cursor's worktrees.json setup runs in the worktree with ROOT_WORKTREE_PATH, then hands over", (t) => {
-  const r = repo();
-  t.after(r.close);
-  mkdirSync(path.join(r.dir, '.cursor'));
-  writeFileSync(path.join(r.dir, '.cursor', 'worktrees.json'), JSON.stringify({ 'setup-worktree': ['echo "$ROOT_WORKTREE_PATH" > root.txt', 'pwd > where.txt'] }));
-  const trees = new Worktrees(r.dir);
-  const made = trees.create('pixel-a1b2', 'feat/setup');
-  if (typeof made === 'string') return assert.fail(made);
-  const script = trees.setupScript(made.path);
-  assert.ok(script);
-  const wt = path.join(r.dir, made.path);
-  const out = execFileSync('sh', ['-c', `${script}\nexec "$0" "$@"`, 'echo', 'agent started'], { cwd: wt, encoding: 'utf8' });
-  assert.match(out, /agent started/);
-  assert.equal(readFileSync(path.join(wt, 'root.txt'), 'utf8').trim(), r.dir);
-  assert.equal(realpathSync(readFileSync(path.join(wt, 'where.txt'), 'utf8').trim()), realpathSync(wt));
-});
-
-test('a failing setup still starts the worker, and a script path or -unix entry is used', (t) => {
-  const r = repo();
-  t.after(r.close);
-  mkdirSync(path.join(r.dir, '.cursor'));
-  writeFileSync(path.join(r.dir, '.cursor', 'setup.sh'), 'touch from-script.txt\nexit 3\n');
-  writeFileSync(path.join(r.dir, '.cursor', 'worktrees.json'), JSON.stringify({ 'setup-worktree-unix': 'setup.sh', 'setup-worktree': ['touch generic.txt'] }));
-  const trees = new Worktrees(r.dir);
-  const made = trees.create('pixel-a1b2', 'feat/fails');
-  if (typeof made === 'string') return assert.fail(made);
-  const wt = path.join(r.dir, made.path);
-  const out = execFileSync('sh', ['-c', `${trees.setupScript(made.path)}\nexec "$0" "$@"`, 'echo', 'agent started'], { cwd: wt, encoding: 'utf8' });
-  assert.match(out, /setup failed \(exit 3\)/);
-  assert.match(out, /agent started/);
-  assert.equal(existsSync(path.join(wt, 'from-script.txt')), true);
-  assert.equal(existsSync(path.join(wt, 'generic.txt')), false);
-});
-
-test('no worktrees.json, no setup', (t) => {
-  const r = repo();
-  t.after(r.close);
-  const trees = new Worktrees(r.dir);
-  const made = trees.create('pixel-a1b2', 'feat/plain');
-  if (typeof made === 'string') return assert.fail(made);
-  assert.equal(trees.setupScript(made.path), undefined);
+test('a worktree deleted with its branch comes back from origin when it was pushed', async (t) => {
+  const f = fixture(t);
+  const trees = new Worktrees(f.dir);
+  const made = trees.create('rex-9');
+  assert.ok(typeof made !== 'string', String(made));
+  const abs = path.join(f.dir, made.path);
+  const run = (...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: abs, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  writeFileSync(path.join(abs, 'pushed.txt'), 'pushed');
+  run('add', '.');
+  run('commit', '-qm', 'pushed');
+  run('push', '-q', 'origin', made.branch);
+  const pushed = run('rev-parse', 'HEAD');
+  assert.equal(trees.branchState(made.branch), 'here');
+  rmSync(abs, { recursive: true, force: true });
+  f.git('worktree', 'prune');
+  f.git('branch', '-D', made.branch);
+  assert.equal(trees.branchState(made.branch), 'origin');
+  assert.deepEqual(await trees.restore(made), { from: 'origin' });
+  assert.equal(run('rev-parse', 'HEAD'), pushed);
+  assert.equal(run('rev-parse', '--abbrev-ref', 'HEAD'), made.branch);
+  // Checked out somewhere else already, it can't come back here: git says why.
+  rmSync(abs, { recursive: true, force: true });
+  f.git('worktree', 'prune');
+  f.git('checkout', '-q', made.branch);
+  const refused = await trees.restore(made);
+  assert.ok('error' in refused && /already (checked out|used by worktree)/.test(refused.error), JSON.stringify(refused));
 });

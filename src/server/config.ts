@@ -4,17 +4,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { WEATHERS, type Weather } from '../shared/protocol.js';
+import { AGENT_PROVIDERS, PROVIDER_META } from '../shared/providers.js';
+import { MAX_WORKER_LIMIT, parseWorkerLimit } from './machine.js';
 
 export interface Config {
   /** The office's own folder: the building's data lives in its .agent-office. */
   dir: string;
   dataDir: string;
-  /** Where new floors are cloned, as <projectsDir>/<owner>/<repo>. */
+  /** Where new floors are cloned by default, as <projectsDir>/<owner>/<repo>. */
   projectsDir: string;
+  /** --projects / AGENT_OFFICE_PROJECTS: picks the projects folder, as ⚙️ Settings in the office does. */
+  projects?: string;
   /** Started as `agent-office <dir>`: that checkout is a floor of its own (it's also `dir`). */
   project?: string;
   host: string;
   port: number;
+  /** Open the office in a browser, signed in, when it's started in a terminal (--no-open: don't). */
+  open: boolean;
   /** Plaintext password, only when known: from --password, or generated and not yet claimed. */
   password?: string;
   passwordGenerated: boolean;
@@ -29,15 +35,24 @@ export interface Config {
   markClaimed(): void;
   agentCmd: string;
   agentArgs: string[];
+  /** The DSH profile a DeepSeek Harness worker boots (`--dsh-profile`, default "acp"). */
+  dshProfile: string;
   tls?: { cert: string; key: string };
   trustProxy: boolean;
   iceServers: RTCIceServerLike[];
-  /** Address teammates SSH-tunnel to (set by deploy/aws.sh); enables invites from the office. */
+  /** How to run the script that deployed the office, e.g. "deploy/azure.sh --name team2" (set by deploy/provision.sh), for the commands it suggests. */
+  deployScript?: string;
+  /** Address teammates SSH-tunnel to (set by deploy/provision.sh); enables invites from the office. */
   publicHost?: string;
-  /** Daily tracked Claude Code spend budget, USD. OpenCode/Codex/Cursor spend is excluded. */
+  /** The office's name on a Tailscale network, e.g. agent-office.tail1234.ts.net (set by deploy/provision.sh --tailscale). */
+  tailnet?: string;
+  /** Daily tracked Claude Code spend budget, USD. OpenCode/Codex/Grok/Muse/Cursor spend is excluded. */
+
   budget?: number;
   /** Refuse new hires for the rest of the day once the budget is spent. */
   budgetPause: boolean;
+  /** The most workers the office runs at once, across every floor; ⚙️ Settings can't go past it. */
+  maxWorkers?: number;
   /** Slack / Discord webhook to post to when a worker needs input or finishes ('' turns it off). */
   webhook?: string;
   /** Where the office is: its sun and live weather follow this city's forecast. */
@@ -52,11 +67,12 @@ export interface RTCIceServerLike {
   credential?: string;
 }
 
-const HELP = `agent-office — a 3D office for your team and its Claude Code / OpenCode / Codex / Cursor workers
+const HELP = `agent-office — a 3D office for your team and its ${AGENT_PROVIDERS.filter((p) => p !== 'custom').map((p) => PROVIDER_META[p].name).join(' / ')} workers
 
 Usage:
   agent-office [options]
   agent-office [dir] [options]
+  agent-office setup [--projects <dir>] [--project <owner/repo>]...
   agent-office prune [dir] [--dry-run] [--force]
   agent-office accounts [list|invite|revoke|role|password] ...
 
@@ -65,13 +81,20 @@ pick one of the repositories your \`gh\` login can see, and the office clones it
 into the projects folder as a new floor. Workers, terminals, boards and the
 task queue on a floor all belong to that floor's checkout.
 
+The first time it starts in a terminal with no floors, it walks you through
+where projects are cloned, signing the GitHub CLI in, and your first project.
+
 Started from anywhere, the office keeps its data in --home. Given a [dir] (or
 started in a project where an office already ran), it keeps its data in
-<dir>/.agent-office as it always has, and that project is one of the floors.
+<dir>/.agent-office as it always has, and that project starts out as a floor
+(an admin can take it off in the elevator like any other).
 
 Commands:
+  setup                   Pick the folder projects are cloned into and clone
+                          projects as floors: a walkthrough in a terminal, or
+                          just --projects / --project for scripts (see setup --help)
   prune                   Remove leftover worker worktrees (.agent-office/worktrees/)
-                          and the branches the office cut. Anything with uncommitted
+                          and their office/* branches. Anything with uncommitted
                           changes or unpushed commits is kept unless --force is given.
   accounts                Invite, list and revoke people's own accounts, and switch
                           the shared password off or on (see accounts --help)
@@ -80,9 +103,11 @@ Options:
       --home <dir>        Where the office keeps its data when no [dir] is given
                           (default ~/agent-office, env AGENT_OFFICE_HOME)
       --projects <dir>    Where new floors are cloned, as <dir>/<owner>/<repo>
-                          (default ~/agent-office, env AGENT_OFFICE_PROJECTS)
+                          (default ~/agent-office, env AGENT_OFFICE_PROJECTS).
+                          Also settable from ⚙️ Settings in the office
   -p, --port <n>          Port to listen on (default 4600, env PORT)
-  -H, --host <addr>       Address to bind (default 0.0.0.0)
+  -H, --host <addr>       Address to bind (default 127.0.0.1: only this machine).
+                          0.0.0.0 lets other computers on your network in
       --password <pw>     Office password (env AGENT_OFFICE_PASSWORD).
                           Without one, a random password is generated once and
                           saved in <dir>/.agent-office/config.json
@@ -91,10 +116,14 @@ Options:
                           is kept and the password is never displayed again.
       --reset-password    Forget the generated password (a new one is made on the
                           next start) and exit
+      --no-open           Don't open the office in your browser when it starts
+                          (env AGENT_OFFICE_NO_OPEN=1)
       --agent <cmd>       Default agent command (default "claude", env AGENT_OFFICE_AGENT)
       --agent-args <str>  Extra args for the configured agent, e.g. "--model opus"
-                          (claude, opencode, codex or cursor-agent). Workers can also
-                          select Claude Code, OpenCode, Codex or Cursor in the UI
+                          Workers can also select Claude Code, OpenCode, Codex, Grok,
+                          Muse, DeepSeek Harness, Pi or Cursor in the UI
+      --dsh-profile <n>   DeepSeek Harness profile for its workers, over the ACP
+                          server (default "acp", env AGENT_OFFICE_DSH_PROFILE)
       --tls-cert <file>   Serve HTTPS with this certificate (PEM)
       --tls-key <file>    ...and this private key (PEM)
       --self-signed       Serve HTTPS with a generated self-signed certificate
@@ -103,20 +132,29 @@ Options:
                           turn:user:pass@turn.example.com:3478
       --budget <usd>      Daily budget for tracked Claude Code spend (env
                           AGENT_OFFICE_BUDGET). Everyone is warned when the
-                          day's spend passes it. OpenCode/Codex/Cursor spend is excluded
+                          day's spend passes it. OpenCode/Codex/Grok/Muse/Cursor spend is excluded
       --budget-pause      ...and no new workers can be hired until the next
                           day (env AGENT_OFFICE_BUDGET_PAUSE=1)
+      --max-workers <n>   Run at most this many workers at once, across every
+                          floor (env AGENT_OFFICE_MAX_WORKERS). Hiring past it
+                          is refused. Admins can lower the limit from ⚙️
+                          Settings, but not raise it past this
       --webhook <url>     Post to this Slack or Discord webhook when a worker
                           needs input or finishes (env AGENT_OFFICE_WEBHOOK).
                           Also settable from ⚙️ Settings in the office; "" turns it off
       --city <name>       Put the office in a real city, e.g. "Berlin" or
-                          "Portland, Oregon" (env AGENT_OFFICE_CITY): day, night
-                          and the weather outside follow its live forecast from
-                          open-meteo.com. Without it the sun follows this
-                          machine's clock and the weather is made up
+                          "Portland, Oregon" (env AGENT_OFFICE_CITY): the sun
+                          keeps its hours of daylight and the weather outside
+                          follows its live forecast from open-meteo.com.
+                          Without it the weather is made up. Either way a
+                          whole day and night go by every hour
       --weather <kind>    Pin the weather: clear, cloudy, rain, storm, snow or
                           fog (env AGENT_OFFICE_WEATHER)
   -h, --help              Show this help
+
+Started in a terminal, the office opens in your browser already signed in, with
+a link that works once. Only this machine can reach it unless you pass --host.
+To run it on a server for your team, see deploy/provision.sh.
 
 Voice and screen sharing need a secure context: use https (a reverse proxy,
 --tls-cert/--tls-key or --self-signed) unless everyone is on localhost.
@@ -172,10 +210,13 @@ export function loadConfig(argv: string[]): Config {
   let homeGiven = !!process.env.AGENT_OFFICE_HOME;
   let projects = process.env.AGENT_OFFICE_PROJECTS ? path.resolve(process.env.AGENT_OFFICE_PROJECTS) : '';
   let port = Number(process.env.PORT) || 4600;
-  let host = '0.0.0.0';
+  // Loopback unless asked: an office lets whoever signs in run commands on this machine.
+  let host = '127.0.0.1';
+  let open = !process.env.AGENT_OFFICE_NO_OPEN || process.env.AGENT_OFFICE_NO_OPEN === '0';
   let password = process.env.AGENT_OFFICE_PASSWORD || '';
   let agentCmd = process.env.AGENT_OFFICE_AGENT || 'claude';
   let agentArgs: string[] = splitArgs(process.env.AGENT_OFFICE_AGENT_ARGS || '');
+  let dshProfile = process.env.AGENT_OFFICE_DSH_PROFILE || 'acp';
   let tlsCert = '';
   let tlsKey = '';
   let selfSigned = false;
@@ -184,6 +225,7 @@ export function loadConfig(argv: string[]): Config {
   let resetPassword = false;
   let budget = process.env.AGENT_OFFICE_BUDGET || '';
   let budgetPause = !!process.env.AGENT_OFFICE_BUDGET_PAUSE && process.env.AGENT_OFFICE_BUDGET_PAUSE !== '0';
+  let maxWorkers = process.env.AGENT_OFFICE_MAX_WORKERS || '';
   let webhook = process.env.AGENT_OFFICE_WEBHOOK;
   let city = process.env.AGENT_OFFICE_CITY || '';
   let weather = process.env.AGENT_OFFICE_WEATHER || '';
@@ -211,7 +253,12 @@ export function loadConfig(argv: string[]): Config {
         agentCmd = takeValue(argv, i++, a);
         break;
       case '--agent-args':
-        agentArgs = splitArgs(takeValue(argv, i++, a));
+        // Its value is flags itself ("--model opus"), so a leading -- doesn't mean the value is missing.
+        if (argv[i + 1] === undefined) takeValue(argv, i, a);
+        agentArgs = splitArgs(argv[++i]);
+        break;
+      case '--dsh-profile':
+        dshProfile = takeValue(argv, i++, a);
         break;
       case '--tls-cert':
         tlsCert = takeValue(argv, i++, a);
@@ -231,6 +278,9 @@ export function loadConfig(argv: string[]): Config {
       case '--reset-password':
         resetPassword = true;
         break;
+      case '--no-open':
+        open = false;
+        break;
       case '--turn':
         iceServers.push(parseTurn(takeValue(argv, i++, a)));
         break;
@@ -239,6 +289,9 @@ export function loadConfig(argv: string[]): Config {
         break;
       case '--budget-pause':
         budgetPause = true;
+        break;
+      case '--max-workers':
+        maxWorkers = takeValue(argv, i++, a);
         break;
       case '--webhook':
         webhook = takeValue(argv, i++, a);
@@ -276,7 +329,7 @@ export function loadConfig(argv: string[]): Config {
   }
   const dir = project || home;
   // New floors go next to the office's data when it has a home of its own, and never into a project.
-  const projectsDir = projects || (project ? path.join(os.homedir(), 'agent-office') : home);
+  const projectsDir = project ? path.join(os.homedir(), 'agent-office') : home;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     console.error('agent-office: invalid --port');
     process.exit(2);
@@ -284,6 +337,11 @@ export function loadConfig(argv: string[]): Config {
   const budgetUsd = budget ? Number(budget.replace(/^\$/, '')) : undefined;
   if (budgetUsd !== undefined && !(budgetUsd > 0)) {
     console.error('agent-office: --budget needs an amount in dollars, e.g. --budget 20');
+    process.exit(2);
+  }
+  const workerLimit = maxWorkers ? parseWorkerLimit(maxWorkers) : undefined;
+  if (maxWorkers && workerLimit === undefined) {
+    console.error(`agent-office: --max-workers needs a whole number from 1 to ${MAX_WORKER_LIMIT}, e.g. --max-workers 6`);
     process.exit(2);
   }
   weather = weather.trim().toLowerCase();
@@ -353,9 +411,11 @@ export function loadConfig(argv: string[]): Config {
     dir,
     dataDir,
     projectsDir,
+    projects: projects || undefined,
     project: project || undefined,
     host,
     port,
+    open,
     password: password || undefined,
     passwordGenerated,
     verifier,
@@ -372,12 +432,16 @@ export function loadConfig(argv: string[]): Config {
     },
     agentCmd,
     agentArgs,
+    dshProfile: dshProfile.trim() || 'acp',
     tls,
     trustProxy,
     iceServers,
+    deployScript: process.env.AGENT_OFFICE_DEPLOY_SCRIPT || undefined,
     publicHost: process.env.AGENT_OFFICE_PUBLIC_HOST || undefined,
+    tailnet: process.env.AGENT_OFFICE_TAILSCALE_HOST?.toLowerCase().replace(/\.$/, '') || undefined,
     budget: budgetUsd,
     budgetPause,
+    maxWorkers: workerLimit,
     webhook,
     city: city.trim() || undefined,
     weather: (weather as Weather) || undefined,

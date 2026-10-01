@@ -1,19 +1,59 @@
-import type { AgentProvider, ProjectInfo, Usage } from '../../shared/protocol';
+import './provider.css';
+import type { AgentChoice, AgentEffort, AgentProvider, ClaudeModel, ProjectInfo, Usage } from '../../shared/protocol';
+import { AGENT_EFFORTS, CLAUDE_MODELS } from '../../shared/protocol';
+import {
+  AGENT_PROVIDERS,
+  CODEX_MODEL_MAX,
+  CURSOR_MODEL_MAX,
+  DSH_MODEL_MAX,
+  MUSE_MODEL_MAX,
+  OPEN_CODE_MODEL_MAX as MODEL_MAX,
+  PI_MODEL_MAX,
+  PROVIDER_META,
+  isAgentProvider,
+  isValidCodexModel as validCodexModel,
+  isValidCursorModel as validCursorModel,
+  isValidDshModel as validDshModel,
+  isValidGrokModel as validGrokModel,
+  isValidMuseModel as validMuseModel,
+  isValidOpenCodeModel as validModel,
+  isValidPiModel as validPiModel,
+  takesEffort,
+} from '../../shared/providers';
+import { store } from '../state';
 import { h } from './dom';
 
-const PROVIDER_KEY = 'agent-office.provider';
+export const PROVIDER_LABEL = Object.fromEntries(AGENT_PROVIDERS.map((p) => [p, PROVIDER_META[p].label])) as Record<AgentProvider, string>;
 
-export const PROVIDER_LABEL: Record<AgentProvider, string> = {
-  claude: 'Claude Code',
-  opencode: 'OpenCode',
-  codex: 'Codex',
-  cursor: 'Cursor',
-  custom: 'Custom',
+export const CLAUDE_MODEL_LABEL: Record<ClaudeModel, string> = {
+  fable: 'Fable',
+  opus: 'Opus',
+  sonnet: 'Sonnet',
+  haiku: 'Haiku',
 };
+
+export const EFFORT_LABEL: Record<AgentEffort, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra high',
+  max: 'Max',
+};
+
+/** A short badge for the task card / sidebar: "Opus", "Opus · High", or the raw OpenCode/Grok/Muse/DeepSeek Harness/Pi model id. */
+export function modelBadge(provider: AgentProvider | undefined, model: string | undefined, effort: AgentEffort | undefined): string | undefined {
+  if (!model && !effort) return undefined;
+  if (takesEffort(provider)) {
+    const label = provider === 'claude' && model && model in CLAUDE_MODEL_LABEL ? CLAUDE_MODEL_LABEL[model as ClaudeModel] : model;
+    const parts = [label, effort ? EFFORT_LABEL[effort] : undefined].filter((v): v is string => !!v);
+    return parts.length ? parts.join(' · ') : undefined;
+  }
+  return model;
+}
 
 /** Providers the server says this project can start. */
 export function supportedProviders(project: ProjectInfo | null): AgentProvider[] {
-  const values = project?.agentProviders?.filter((p): p is AgentProvider => p === 'claude' || p === 'opencode' || p === 'codex' || p === 'cursor' || p === 'custom') ?? [];
+  const values = project?.agentProviders?.filter(isAgentProvider) ?? [];
   if (values.length) return [...new Set(values)];
   return project?.defaultProvider && PROVIDER_LABEL[project.defaultProvider] ? [project.defaultProvider] : ['claude'];
 }
@@ -32,168 +72,509 @@ export function providerLabel(provider: AgentProvider | undefined, project: Proj
 }
 
 export function providerUsageTracked(provider: AgentProvider | undefined, project: ProjectInfo | null, usage?: Usage): boolean {
-  const selected = resolvedProvider(provider, project);
-  return selected === 'claude' || ((selected === 'opencode' || selected === 'codex' || selected === 'cursor' || selected === 'custom') && usage !== undefined);
+  return !!PROVIDER_META[resolvedProvider(provider, project)].usage.tracked || usage !== undefined;
 }
 
 export type ProviderUsageState = 'tracked' | 'waiting' | 'untracked';
 
 /** Distinguishes a provider with no first report from one whose metrics are intentionally unavailable. */
 export function providerUsageState(provider: AgentProvider | undefined, project: ProjectInfo | null, usage?: Usage): ProviderUsageState {
-  const selected = resolvedProvider(provider, project);
-  if (selected === 'claude') return usage ? 'tracked' : 'waiting';
-  if (selected === 'opencode') return usage ? 'tracked' : 'waiting';
-  if (selected === 'codex') return usage ? 'tracked' : 'waiting';
-  if (selected === 'cursor') return usage ? 'tracked' : 'waiting';
-  if (selected === 'custom') return usage ? 'tracked' : 'untracked';
-  return 'untracked';
+  const { tracked, reports } = PROVIDER_META[resolvedProvider(provider, project)].usage;
+  if (usage) return 'tracked';
+  return tracked || reports ? 'waiting' : 'untracked';
+}
+
+/**
+ * The short "no numbers yet" suffix for a tracked-but-silent provider, shared by the terminal, the
+ * workers list and the queue so all three say the same thing.
+ */
+export function providerWaitingLabel(provider: AgentProvider | undefined, project: ProjectInfo | null): string {
+  return PROVIDER_META[resolvedProvider(provider, project)].usage.waiting ?? '';
 }
 
 export function providerUsageNote(provider: AgentProvider): string {
-  if (provider === 'claude') return 'Office usage and budget track Claude Code.';
-  if (provider === 'codex') return 'Review Office hooks in /hooks to enable tracking. Codex reports root-session tokens; subagents are excluded and cost is unavailable.';
-  if (provider === 'custom') return 'Usage is untracked unless compatible Claude Code hooks report it.';
-  if (provider === 'cursor') return "Runs cursor-agent. Cursor reports each turn's tokens; the cost is an office estimate from list prices, not billing.";
-  return 'OpenCode reports model/provider estimates; they are not billing, and arrive after the first report.';
+  return PROVIDER_META[provider].usage.note;
 }
 
-function preferredProvider(options: AgentProvider[], fallback: AgentProvider): AgentProvider {
-  try {
-    const saved = localStorage.getItem(PROVIDER_KEY);
-    if (saved && options.includes(saved as AgentProvider)) return saved as AgentProvider;
-  } catch {
-    // storage blocked
+/**
+ * The worker a new one starts on unless someone picks another: the one set in ⚙️ Settings, or the
+ * office's --agent on its own default model.
+ */
+export function officeChoice(project: ProjectInfo | null): AgentChoice {
+  const picked = store.prompts.agent;
+  if (picked && supportedProviders(project).includes(picked.provider)) {
+    return { provider: picked.provider, ...(picked.model ? { model: picked.model } : {}), ...(picked.effort ? { effort: picked.effort } : {}) };
   }
-  return options.includes(fallback) ? fallback : options[0];
+  return { provider: resolvedProvider(project?.defaultProvider, project) };
+}
+
+/** "Claude Code · Opus · High", "Claude Code", "OpenCode · anthropic/claude-sonnet-4", "Grok · grok-4.6". */
+export function choiceLabel(choice: AgentChoice): string {
+  const badge = modelBadge(choice.provider, choice.model, choice.effort);
+  return badge ? `${PROVIDER_LABEL[choice.provider]} · ${badge}` : PROVIDER_LABEL[choice.provider];
 }
 
 export interface ProviderPicker {
   element: HTMLElement;
   value(): AgentProvider;
-  /** The optional model override for the selected provider. Empty or invalid input is omitted. */
+  /** The optional initial model override: an OpenCode provider/model id, a Claude model alias, a Grok/Muse model id, or a DeepSeek Harness catalog id. */
   model(): string | undefined;
-  /** Reports a visible field error for an invalid nonempty model. */
+  /** The optional Claude, Grok, Muse, DeepSeek Harness or Pi reasoning effort (Pi calls it thinking). */
+  effort(): AgentEffort | undefined;
+  /** Reports a visible field error for an invalid nonempty OpenCode model. */
   valid(): boolean;
 }
 
-const MODEL_MAX = 256;
-/** Providers whose CLI takes a model; the server's agents.ts MODEL_FLAGS. */
-const MODEL_PROVIDERS: AgentProvider[] = ['claude', 'opencode', 'codex', 'cursor'];
-const MODEL_EXAMPLE: Partial<Record<AgentProvider, string>> = {
-  claude: 'e.g. opus or sonnet',
-  opencode: 'provider/model',
-  codex: 'e.g. gpt-5-codex',
-  cursor: 'e.g. auto',
-};
-const modelLists = new Map<AgentProvider, { models: string[]; at: number }>();
-const modelRequests = new Map<AgentProvider, Promise<string[]>>();
-
-/** Mirrors the server's isValidModel: argv-safe ids, and OpenCode's are provider/model. */
-function validModel(provider: AgentProvider, value: string): boolean {
-  if (value.length === 0 || value.length > MODEL_MAX || /[\s\p{Cc}\p{Cf}]/u.test(value)) return false;
-  if (provider !== 'opencode') return !value.startsWith('-');
-  const parts = value.split('/');
-  return parts.length >= 2 && /^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/.test(parts[0]) && parts.slice(1).every((part) => part.length > 0);
+export interface AgentFields extends ProviderPicker {
+  /** Puts the fields on this provider, model and effort. */
+  set(choice: AgentChoice): void;
+  /** What they're on now. */
+  choice(): AgentChoice;
 }
 
-function fetchModels(provider: AgentProvider): Promise<string[]> {
-  const cached = modelLists.get(provider);
-  if (cached && Date.now() - cached.at < 60_000) return Promise.resolve(cached.models);
-  const pending = modelRequests.get(provider);
-  if (pending) return pending;
-  const request = fetch(`/api/agents/${provider}/models`, { credentials: 'same-origin', cache: 'no-store' })
+let modelList: string[] | null = null;
+let modelListAt = 0;
+let modelRequest: Promise<string[]> | null = null;
+let grokModelList: string[] | null = null;
+let grokModelListAt = 0;
+let grokModelRequest: Promise<string[]> | null = null;
+
+function fetchGrokModels(): Promise<string[]> {
+  if (grokModelList && Date.now() - grokModelListAt < 60_000) return Promise.resolve(grokModelList);
+  if (grokModelRequest) return grokModelRequest;
+  grokModelRequest = fetch('/api/agents/grok/models', { credentials: 'same-origin', cache: 'no-store' })
     .then(async (res) => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { models?: unknown };
-      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validModel(provider, m)) : [];
-      const list = [...new Set(models)];
-      modelLists.set(provider, { models: list, at: Date.now() });
-      return list;
+      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validGrokModel(m)) : [];
+      grokModelList = [...new Set(models)];
+      grokModelListAt = Date.now();
+      return grokModelList;
     })
     .finally(() => {
-      modelRequests.delete(provider);
+      grokModelRequest = null;
     });
-  modelRequests.set(provider, request);
-  return request;
+  return grokModelRequest;
 }
 
-/** A provider selector that never offers a provider outside the server's metadata. */
-export function providerPicker(project: ProjectInfo | null, id: string, label = 'Worker provider'): ProviderPicker {
+let cursorModelList: string[] | null = null;
+let cursorModelListAt = 0;
+let cursorModelRequest: Promise<string[]> | null = null;
+
+function fetchCursorModels(): Promise<string[]> {
+  if (cursorModelList && Date.now() - cursorModelListAt < 60_000) return Promise.resolve(cursorModelList);
+  if (cursorModelRequest) return cursorModelRequest;
+  cursorModelRequest = fetch('/api/agents/cursor/models', { credentials: 'same-origin', cache: 'no-store' })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = (await res.json()) as { models?: unknown };
+      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validCursorModel(m)) : [];
+      cursorModelList = [...new Set(models)];
+      cursorModelListAt = Date.now();
+      return cursorModelList;
+    })
+    .finally(() => {
+      cursorModelRequest = null;
+    });
+  return cursorModelRequest;
+}
+
+function fetchOpenCodeModels(): Promise<string[]> {
+  if (modelList && Date.now() - modelListAt < 60_000) return Promise.resolve(modelList);
+  if (modelRequest) return modelRequest;
+  modelRequest = fetch('/api/agents/opencode/models', { credentials: 'same-origin', cache: 'no-store' })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = (await res.json()) as { models?: unknown };
+      const models = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === 'string' && validModel(m)) : [];
+      modelList = [...new Set(models)];
+      modelListAt = Date.now();
+      return modelList;
+    })
+    .finally(() => {
+      modelRequest = null;
+    });
+  return modelRequest;
+}
+
+/**
+ * The provider, model and effort fields: a provider selector that never offers a provider outside
+ * the server's metadata, with a model (and, for Claude, Grok or Muse, reasoning effort) picker underneath.
+ */
+export function agentFields(project: ProjectInfo | null, id: string, initial: AgentChoice, label = 'Provider'): AgentFields {
   const options = supportedProviders(project);
   const fallback = resolvedProvider(project?.defaultProvider, project);
   const select = h('select.provider-select', { id, 'aria-label': 'Worker provider' }) as HTMLSelectElement;
   for (const provider of options) select.append(h('option', { value: provider }, PROVIDER_LABEL[provider]));
-  select.value = preferredProvider(options, fallback);
-  const note = h('small.provider-note', {}, providerUsageNote(select.value as AgentProvider));
+  const note = h('small.provider-note');
   const modelInput = h('input', {
     type: 'text',
     id: `${id}-model`,
     list: `${id}-models`,
+    placeholder: 'Default (OpenCode settings)',
+    'aria-label': 'OpenCode model',
     autocomplete: 'off',
     maxlength: MODEL_MAX,
   }) as HTMLInputElement;
-  const modelHint = h('small.provider-model-hint');
+  const modelHint = h('small.provider-model-hint', {}, 'Optional provider/model override; suggestions load when OpenCode is selected.');
   const modelListEl = h('datalist', { id: `${id}-models` });
-  const modelLabel = h('label', { for: `${id}-model` });
-  const modelChoice = h('div.provider-model', {}, modelLabel, modelInput, modelListEl, modelHint);
-  const selected = () => select.value as AgentProvider;
-  const setModelChoice = (provider: AgentProvider) => {
-    const picks = MODEL_PROVIDERS.includes(provider);
-    modelChoice.classList.toggle('hidden', !picks);
-    modelInput.disabled = !picks;
-    // A model belongs to one provider, so switching starts the choice over.
-    modelInput.value = '';
-    modelInput.setCustomValidity('');
-    modelListEl.replaceChildren();
-    if (!picks) return;
-    const name = PROVIDER_LABEL[provider];
-    modelLabel.textContent = `${name} model`;
-    modelInput.placeholder = `Default (${name} settings)`;
-    modelInput.setAttribute('aria-label', `${name} model`);
-    const manual = `Optional; type a model id (${MODEL_EXAMPLE[provider]}).`;
-    modelHint.textContent = modelLists.has(provider) ? manual : `Loading ${name} models… ${manual}`;
-    void fetchModels(provider)
+  const modelChoice = h('div.provider-model', {}, h('label', { for: `${id}-model` }, 'OpenCode model'), modelInput, modelListEl, modelHint);
+
+  const claudeModelSelect = h('select', { id: `${id}-claude-model`, 'aria-label': 'Claude model' }) as HTMLSelectElement;
+  claudeModelSelect.append(h('option', { value: '' }, 'Default (--agent-args)'));
+  for (const m of CLAUDE_MODELS) claudeModelSelect.append(h('option', { value: m }, CLAUDE_MODEL_LABEL[m]));
+  const effortSelect = h('select', { id: `${id}-effort`, 'aria-label': 'Reasoning effort' }) as HTMLSelectElement;
+  effortSelect.append(h('option', { value: '' }, 'Default'));
+  for (const e of AGENT_EFFORTS) effortSelect.append(h('option', { value: e }, EFFORT_LABEL[e]));
+  const claudeChoice = h(
+    'div.provider-model.claude-model',
+    {},
+    h('label', { for: `${id}-claude-model` }, 'Model'),
+    claudeModelSelect,
+    h('label', { for: `${id}-effort` }, 'Effort'),
+    effortSelect,
+    h('small.provider-model-hint', {}, 'The cost panel tracks each model separately.'),
+  );
+
+  const grokModelSelect = h('select', { id: `${id}-grok-model`, 'aria-label': 'Grok model' }) as HTMLSelectElement;
+  grokModelSelect.append(h('option', { value: '' }, 'Default (Grok settings)'));
+  const grokEffortSelect = h('select', { id: `${id}-grok-effort`, 'aria-label': 'Grok reasoning effort' }) as HTMLSelectElement;
+  grokEffortSelect.append(h('option', { value: '' }, 'Default'));
+  for (const e of AGENT_EFFORTS) grokEffortSelect.append(h('option', { value: e }, EFFORT_LABEL[e]));
+  const grokHint = h('small.provider-model-hint', {}, 'Suggestions load from `grok models` when Grok is selected.');
+  const grokChoice = h(
+    'div.provider-model.grok-model',
+    {},
+    h('label', { for: `${id}-grok-model` }, 'Model'),
+    grokModelSelect,
+    h('label', { for: `${id}-grok-effort` }, 'Effort'),
+    grokEffortSelect,
+    grokHint,
+  );
+
+  const museModelInput = h('input', {
+    type: 'text',
+    id: `${id}-muse-model`,
+    placeholder: 'Default (Muse settings)',
+    'aria-label': 'Muse model',
+    autocomplete: 'off',
+    maxlength: MUSE_MODEL_MAX,
+  }) as HTMLInputElement;
+  const museEffortSelect = h('select', { id: `${id}-muse-effort`, 'aria-label': 'Muse reasoning effort' }) as HTMLSelectElement;
+  museEffortSelect.append(h('option', { value: '' }, 'Default'));
+  for (const e of AGENT_EFFORTS) museEffortSelect.append(h('option', { value: e }, EFFORT_LABEL[e]));
+  const museChoice = h(
+    'div.provider-model.muse-model',
+    {},
+    h('label', { for: `${id}-muse-model` }, 'Model'),
+    museModelInput,
+    h('label', { for: `${id}-muse-effort` }, 'Effort'),
+    museEffortSelect,
+    h('small.provider-model-hint', {}, 'Optional model id (for example muse-spark-1.3-contributor) and effort for this worker.'),
+  );
+
+  const dshModelInput = h('input', {
+    type: 'text',
+    id: `${id}-dsh-model`,
+    placeholder: 'Default (DSH profile)',
+    'aria-label': 'DeepSeek Harness model',
+    autocomplete: 'off',
+    maxlength: DSH_MODEL_MAX,
+  }) as HTMLInputElement;
+  const dshEffortSelect = h('select', { id: `${id}-dsh-effort`, 'aria-label': 'DeepSeek Harness reasoning effort' }) as HTMLSelectElement;
+  dshEffortSelect.append(h('option', { value: '' }, 'Default'));
+  for (const e of AGENT_EFFORTS) dshEffortSelect.append(h('option', { value: e }, EFFORT_LABEL[e]));
+  const dshChoice = h(
+    'div.provider-model.dsh-model',
+    {},
+    h('label', { for: `${id}-dsh-model` }, 'Model'),
+    dshModelInput,
+    h('label', { for: `${id}-dsh-effort` }, 'Effort'),
+    dshEffortSelect,
+    h('small.provider-model-hint', {}, 'Optional model id from DeepSeek Harness\u2019s catalog, and effort; leave empty to use the profile default.'),
+  );
+
+  const piModelInput = h('input', {
+    type: 'text',
+    id: `${id}-pi-model`,
+    placeholder: 'Default (Pi settings)',
+    'aria-label': 'Pi model',
+    autocomplete: 'off',
+    maxlength: PI_MODEL_MAX,
+  }) as HTMLInputElement;
+  const piEffortSelect = h('select', { id: `${id}-pi-effort`, 'aria-label': 'Pi thinking level' }) as HTMLSelectElement;
+  piEffortSelect.append(h('option', { value: '' }, 'Default'));
+  for (const e of AGENT_EFFORTS) piEffortSelect.append(h('option', { value: e }, EFFORT_LABEL[e]));
+  const piChoice = h(
+    'div.provider-model.pi-model',
+    {},
+    h('label', { for: `${id}-pi-model` }, 'Model'),
+    piModelInput,
+    h('label', { for: `${id}-pi-effort` }, 'Thinking'),
+    piEffortSelect,
+    h('small.provider-model-hint', {}, 'Optional model name or provider/model; leave Default to use Pi settings.'),
+  );
+
+  const cursorModelInput = h('input', {
+    type: 'text',
+    id: `${id}-cursor-model`,
+    list: `${id}-cursor-models`,
+    placeholder: 'Default (Cursor settings)',
+    'aria-label': 'Cursor model',
+    autocomplete: 'off',
+    maxlength: CURSOR_MODEL_MAX,
+  }) as HTMLInputElement;
+  const cursorModelListEl = h('datalist', { id: `${id}-cursor-models` });
+  const cursorHint = h('small.provider-model-hint', {}, 'Optional model id; suggestions load from `cursor-agent models` when Cursor is selected.');
+  const cursorChoice = h('div.provider-model.cursor-model', {}, h('label', { for: `${id}-cursor-model` }, 'Model'), cursorModelInput, cursorModelListEl, cursorHint);
+
+  const codexModelInput = h('input', {
+    type: 'text',
+    id: `${id}-codex-model`,
+    placeholder: 'Default (Codex settings)',
+    'aria-label': 'Codex model',
+    autocomplete: 'off',
+    maxlength: CODEX_MODEL_MAX,
+  }) as HTMLInputElement;
+  const codexChoice = h('div.provider-model.codex-model', {}, h('label', { for: `${id}-codex-model` }, 'Model'), codexModelInput, h('small.provider-model-hint', {}, 'Optional model id (for example gpt-5-codex); leave empty to use Codex settings.'));
+
+  const element = h('div.provider-choice', {}, h('label', { for: id }, label), select, note, modelChoice, claudeChoice, grokChoice, museChoice, dshChoice, piChoice, cursorChoice, codexChoice);
+  const fillGrokModels = (models: string[], selected?: string) => {
+    const keep = selected && validGrokModel(selected) ? selected : '';
+    grokModelSelect.replaceChildren(h('option', { value: '' }, 'Default (Grok settings)'));
+    const seen = new Set<string>();
+    for (const model of models) {
+      if (!validGrokModel(model) || seen.has(model)) continue;
+      seen.add(model);
+      grokModelSelect.append(h('option', { value: model }, model));
+    }
+    if (keep && !seen.has(keep)) grokModelSelect.append(h('option', { value: keep }, keep));
+    grokModelSelect.value = keep;
+  };
+  /** OpenCode's model suggestions, asked for only once someone can see the field. */
+  const loadModels = () => {
+    if (select.value === 'grok') {
+      if (!element.isConnected || element.closest('.hidden')) return;
+      grokHint.textContent = grokModelList ? 'Optional model and effort for this worker.' : 'Loading Grok models…';
+      void fetchGrokModels()
+        .then((models) => {
+          fillGrokModels(models, grokModelSelect.value);
+          grokHint.textContent = 'Optional model and effort for this worker.';
+        })
+        .catch(() => {
+          grokHint.textContent = 'Model list unavailable; leave Default or pick a known Grok model id.';
+        });
+      return;
+    }
+    if (select.value === 'cursor') {
+      if (!element.isConnected || element.closest('.hidden')) return;
+      cursorHint.textContent = cursorModelList ? 'Optional model id; choose a suggestion or type one.' : 'Loading Cursor models… You can type a model id.';
+      void fetchCursorModels()
+        .then((models) => {
+          cursorModelListEl.replaceChildren(...models.map((model) => h('option', { value: model })));
+          cursorHint.textContent = 'Optional model id; choose a suggestion or type one.';
+        })
+        .catch(() => {
+          cursorHint.textContent = 'Model suggestions unavailable; type a model id if needed.';
+        });
+      return;
+    }
+    if (select.value !== 'opencode' || !element.isConnected || element.closest('.hidden')) return;
+    modelHint.textContent = modelList ? 'Optional provider/model override; choose a suggestion or enter one manually.' : 'Loading OpenCode models… You can enter a provider/model manually.';
+    void fetchOpenCodeModels()
       .then((models) => {
-        if (selected() !== provider) return;
         modelListEl.replaceChildren(...models.map((model) => h('option', { value: model })));
-        modelHint.textContent = models.length ? 'Optional; choose a suggestion or type a model id.' : manual;
+        modelHint.textContent = 'Optional provider/model override; choose a suggestion or enter one manually.';
       })
       .catch(() => {
-        if (selected() === provider) modelHint.textContent = `Model suggestions unavailable. ${manual}`;
+        modelHint.textContent = 'Model suggestions unavailable; enter a provider/model manually if needed.';
       });
   };
-  setModelChoice(selected());
-  select.addEventListener('change', () => {
-    const provider = selected();
+  const setModelVisibility = (provider: AgentProvider) => {
+    const openCode = provider === 'opencode';
     note.textContent = providerUsageNote(provider);
-    setModelChoice(provider);
-    if (options.includes(provider)) {
-      try {
-        localStorage.setItem(PROVIDER_KEY, provider);
-      } catch {
-        // storage blocked
-      }
-    }
-  });
+    modelChoice.classList.toggle('hidden', !openCode);
+    modelInput.disabled = !openCode;
+    claudeChoice.classList.toggle('hidden', provider !== 'claude');
+    grokChoice.classList.toggle('hidden', provider !== 'grok');
+    museChoice.classList.toggle('hidden', provider !== 'muse');
+    dshChoice.classList.toggle('hidden', provider !== 'dsh');
+    piChoice.classList.toggle('hidden', provider !== 'pi');
+    cursorChoice.classList.toggle('hidden', provider !== 'cursor');
+    codexChoice.classList.toggle('hidden', provider !== 'codex');
+    cursorModelInput.disabled = provider !== 'cursor';
+    loadModels();
+  };
+  const set = (c: AgentChoice) => {
+    select.value = options.includes(c.provider) ? c.provider : options.includes(fallback) ? fallback : options[0];
+    const claude = select.value === 'claude';
+    const grok = select.value === 'grok';
+    const muse = select.value === 'muse';
+    const dsh = select.value === 'dsh';
+    const pi = select.value === 'pi';
+    const cursor = select.value === 'cursor';
+    codexModelInput.value = select.value === 'codex' && c.model ? c.model : '';
+    codexModelInput.setCustomValidity('');
+    claudeModelSelect.value = claude && c.model && (CLAUDE_MODELS as readonly string[]).includes(c.model) ? c.model : '';
+    effortSelect.value = claude && c.effort ? c.effort : '';
+    fillGrokModels(grokModelList ?? [], grok ? c.model : undefined);
+    grokEffortSelect.value = grok && c.effort ? c.effort : '';
+    museModelInput.value = muse && c.model ? c.model : '';
+    museEffortSelect.value = muse && c.effort ? c.effort : '';
+    dshModelInput.value = dsh && c.model ? c.model : '';
+    dshEffortSelect.value = dsh && c.effort ? c.effort : '';
+    piModelInput.value = pi && c.model ? c.model : '';
+    piEffortSelect.value = pi && c.effort ? c.effort : '';
+    cursorModelInput.value = cursor && c.model ? c.model : '';
+    cursorModelInput.setCustomValidity('');
+    modelInput.value = select.value === 'opencode' && c.model ? c.model : '';
+    modelInput.setCustomValidity('');
+    museModelInput.setCustomValidity('');
+    dshModelInput.setCustomValidity('');
+    piModelInput.setCustomValidity('');
+    setModelVisibility(select.value as AgentProvider);
+  };
+  set(initial);
+  select.addEventListener('change', () => setModelVisibility(select.value as AgentProvider));
+  modelInput.addEventListener('focus', loadModels);
   modelInput.addEventListener('input', () => modelInput.setCustomValidity(''));
+  museModelInput.addEventListener('input', () => museModelInput.setCustomValidity(''));
+  dshModelInput.addEventListener('input', () => dshModelInput.setCustomValidity(''));
+  piModelInput.addEventListener('input', () => piModelInput.setCustomValidity(''));
+  cursorModelInput.addEventListener('input', () => cursorModelInput.setCustomValidity(''));
+  codexModelInput.addEventListener('input', () => codexModelInput.setCustomValidity(''));
+  cursorModelInput.addEventListener('focus', loadModels);
+  const value = () => (options.includes(select.value as AgentProvider) ? (select.value as AgentProvider) : fallback);
+  const effort = () => {
+    if (select.value === 'claude' && effortSelect.value) return effortSelect.value as AgentEffort;
+    if (select.value === 'grok' && grokEffortSelect.value) return grokEffortSelect.value as AgentEffort;
+    if (select.value === 'muse' && museEffortSelect.value) return museEffortSelect.value as AgentEffort;
+    if (select.value === 'dsh' && dshEffortSelect.value) return dshEffortSelect.value as AgentEffort;
+    if (select.value === 'pi' && piEffortSelect.value) return piEffortSelect.value as AgentEffort;
+    return undefined;
+  };
+  const model = () => {
+    if (select.value === 'claude') return claudeModelSelect.value || undefined;
+    if (select.value === 'grok') return grokModelSelect.value || undefined;
+    if (select.value === 'muse') {
+      const v = museModelInput.value;
+      return validMuseModel(v) ? v : undefined;
+    }
+    if (select.value === 'dsh') {
+      const v = dshModelInput.value;
+      return validDshModel(v) ? v : undefined;
+    }
+    if (select.value === 'pi') {
+      const v = piModelInput.value;
+      return validPiModel(v) ? v : undefined;
+    }
+    if (select.value === 'cursor') {
+      const v = cursorModelInput.value.trim();
+      return validCursorModel(v) ? v : undefined;
+    }
+    if (select.value === 'codex') {
+      const v = codexModelInput.value.trim();
+      return validCodexModel(v) ? v : undefined;
+    }
+    if (select.value !== 'opencode') return undefined;
+    const v = modelInput.value;
+    return validModel(v) ? v : undefined;
+  };
   return {
-    element: h('div.provider-choice', {}, h('label', { for: id }, label), select, note, modelChoice),
-    value: () => (options.includes(selected()) ? selected() : fallback),
-    model: () => {
-      const value = modelInput.value.trim();
-      return MODEL_PROVIDERS.includes(selected()) && validModel(selected(), value) ? value : undefined;
-    },
+    element,
+    value,
+    effort,
+    model,
+    set,
+    choice: () => ({ provider: value(), ...(model() ? { model: model() } : {}), ...(effort() ? { effort: effort() } : {}) }),
     valid: () => {
-      const value = modelInput.value.trim();
-      if (!MODEL_PROVIDERS.includes(selected()) || !value) {
+      if (select.value === 'muse') {
+        if (!museModelInput.value) {
+          museModelInput.setCustomValidity('');
+          return true;
+        }
+        const okay = validMuseModel(museModelInput.value);
+        museModelInput.setCustomValidity(okay ? '' : 'Use a Muse model id without whitespace or control characters (up to 128 characters).');
+        if (!okay) museModelInput.reportValidity();
+        return okay;
+      }
+      if (select.value === 'dsh') {
+        if (!dshModelInput.value) {
+          dshModelInput.setCustomValidity('');
+          return true;
+        }
+        const okay = validDshModel(dshModelInput.value);
+        dshModelInput.setCustomValidity(okay ? '' : 'Use a DeepSeek Harness catalog model id of up to 256 characters without control characters.');
+        if (!okay) dshModelInput.reportValidity();
+        return okay;
+      }
+      if (select.value === 'pi') {
+        const okay = !piModelInput.value || validPiModel(piModelInput.value);
+        piModelInput.setCustomValidity(okay ? '' : 'Use a Pi model name or provider/model: letters, digits and . _ : / @ + - (up to 256 characters).');
+        if (!okay) piModelInput.reportValidity();
+        return okay;
+      }
+      if (select.value === 'codex') {
+        const okay = !codexModelInput.value.trim() || validCodexModel(codexModelInput.value.trim());
+        codexModelInput.setCustomValidity(okay ? '' : 'Use a Codex model id without whitespace or control characters that does not start with "-" (up to 256 characters).');
+        if (!okay) codexModelInput.reportValidity();
+        return okay;
+      }
+      if (select.value === 'cursor') {
+        const okay = !cursorModelInput.value.trim() || validCursorModel(cursorModelInput.value.trim());
+        cursorModelInput.setCustomValidity(okay ? '' : 'Use a Cursor model id without whitespace or control characters that does not start with "-" (up to 256 characters).');
+        if (!okay) cursorModelInput.reportValidity();
+        return okay;
+      }
+      if (select.value !== 'opencode' || !modelInput.value) {
         modelInput.setCustomValidity('');
         return true;
       }
-      const okay = validModel(selected(), value);
-      const format = selected() === 'opencode' ? 'Use provider/model format without whitespace or control characters' : 'Use a model id without whitespace or control characters that does not start with "-"';
-      modelInput.setCustomValidity(okay ? '' : `${format} (up to 256 characters).`);
+      const okay = validModel(modelInput.value);
+      modelInput.setCustomValidity(okay ? '' : 'Use provider/model format without whitespace or control characters (up to 256 characters).');
       if (!okay) modelInput.reportValidity();
       return okay;
     },
+  };
+}
+
+/**
+ * Which worker to start: the office's default (⚙️ Settings), shown as a line, with an ✏️ Edit button
+ * that opens the provider, model and effort fields to pick another for this one.
+ */
+export function providerPicker(project: ProjectInfo | null, id: string, label = 'Worker'): ProviderPicker {
+  let editing = false;
+  const fields = agentFields(project, id, officeChoice(project));
+  fields.element.classList.add('hidden');
+  const current = h('span.provider-current');
+  const edit = h('button.btn.small', { type: 'button', 'aria-expanded': 'false' }) as HTMLButtonElement;
+  const element = h('div.provider-pick', {}, h('div.provider-summary', {}, h('span.provider-label', {}, label), current, edit), fields.element);
+  const paint = () => {
+    const def = officeChoice(project);
+    current.textContent = choiceLabel(def);
+    current.title = store.prompts.agent ? 'The office’s default worker, set in ⚙️ Settings' : 'The office’s default worker (its --agent); an admin can pick another in ⚙️ Settings';
+    current.classList.toggle('hidden', editing);
+    edit.textContent = editing ? '↺ Use the default' : '✏️ Edit';
+    edit.title = editing ? `Back to ${choiceLabel(def)}` : 'Pick another provider, model or effort for this one';
+    edit.setAttribute('aria-expanded', String(editing));
+    fields.element.classList.toggle('hidden', !editing);
+  };
+  edit.addEventListener('click', () => {
+    editing = !editing;
+    paint();
+    // They open on the default as it is now.
+    if (!editing) return;
+    fields.set(officeChoice(project));
+    (fields.element.querySelector('select') as HTMLSelectElement | null)?.focus();
+  });
+  paint();
+  // The default can change while this is open; it goes once its window has closed.
+  const off = store.on('prompts', () => (element.isConnected ? paint() : off()));
+  return {
+    element,
+    value: () => (editing ? fields.value() : officeChoice(project).provider),
+    model: () => (editing ? fields.model() : officeChoice(project).model),
+    effort: () => (editing ? fields.effort() : officeChoice(project).effort),
+    valid: () => !editing || fields.valid(),
   };
 }

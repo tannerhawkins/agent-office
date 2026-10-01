@@ -1,9 +1,17 @@
+import './services.css';
 import type { ServiceInfo, ServicesState } from '../../shared/protocol';
 import { store } from '../state';
 import { h, openModal, timeAgo } from './dom';
 import { copy, copyButton, guessOs, openCommand, OS_LABEL, type Os } from './team';
 
-function serviceUrl(port: number): string {
+/** Whether this page came over the office's Tailscale network, where every server has its own link. */
+function onTailnet(s: ServicesState): boolean {
+  return !!s.tailnet && location.hostname === s.tailnet;
+}
+
+export function serviceUrl(port: number, s = store.services): string {
+  // Tailscale Serve points <office>.ts.net:<port> at the office, which relays it by the port.
+  if (onTailnet(s)) return `https://${s.tailnet}:${port}`;
   // The tunnel lands on the office's own port, so it speaks whatever the office speaks.
   return `${location.protocol}//localhost:${port}`;
 }
@@ -20,21 +28,6 @@ export function serviceTunnel(s: ServicesState, port: number, os: Os): string {
 function describe(svc: ServiceInfo): { who: string; color: string; branch?: string } {
   const w = store.workers.get(svc.workerId);
   return { who: w?.name ?? 'A worker', color: w?.color ?? '#8d99ae', branch: w?.worktree?.branch };
-}
-
-/** The 🌐 Services button in the top bar: shows how many are running. */
-export function mountServicesButton(btn: HTMLElement) {
-  const label = h('span', {}, 'Services');
-  const count = h('span.svc-count');
-  btn.replaceChildren('🌐 ', label, count);
-  const render = () => {
-    const n = store.services.items.length;
-    count.textContent = n ? String(n) : '';
-    count.classList.toggle('hidden', !n);
-  };
-  store.on('services', render);
-  render();
-  btn.addEventListener('click', () => openServices());
 }
 
 export function openServices() {
@@ -54,18 +47,31 @@ export function openServices() {
   );
 
   const pick = async (svc: ServiceInfo) => {
+    const s = store.services;
     picked = svc.port;
-    copied = (await copy(serviceTunnel(store.services, svc.port, os))) ? svc.port : null;
+    copied = (await copy(onTailnet(s) ? serviceUrl(svc.port) : serviceTunnel(s, svc.port, os))) ? svc.port : null;
     render();
   };
 
   const render = () => {
     const s = store.services;
+    const direct = onTailnet(s);
     tabs.replaceChildren(
-      ...(Object.keys(OS_LABEL) as Os[]).map((o) => h('button.btn', { type: 'button', class: o === os ? 'on' : '', onclick: () => ((os = o), (copied = null), render()) }, OS_LABEL[o])),
+      ...(direct ? [] : (Object.keys(OS_LABEL) as Os[])).map((o) =>
+        h('button.btn', { type: 'button', class: o === os ? 'on' : '', onclick: () => ((os = o), (copied = null), render()) }, OS_LABEL[o]),
+      ),
     );
+    footer.firstElementChild!.textContent = direct
+      ? 'Every link goes through the office, so the office sign-in still guards every page.'
+      : 'Tunnels go through the office, so the office password still guards every page. Keep the terminal open while you look.';
     body.replaceChildren(
-      h('p.note', { style: 'margin:0 0 12px' }, 'Web servers the workers are running. Click one to copy a command that opens it on your computer — run it in a terminal and the page opens by itself.'),
+      h(
+        'p.note',
+        { style: 'margin:0 0 12px' },
+        direct
+          ? 'Web servers the workers are running. Each has its own link on your Tailscale network: open it, or click the row to copy it for someone else on the network.'
+          : 'Web servers the workers are running. Click one to copy a command that opens it on your computer — run it in a terminal and the page opens by itself.',
+      ),
     );
     if (!s.items.length) {
       body.append(
@@ -82,11 +88,12 @@ export function openServices() {
     for (const svc of s.items) {
       const { who, color, branch } = describe(svc);
       const on = picked === svc.port;
-      const open = h('a.btn', { href: serviceUrl(svc.port), target: '_blank', rel: 'noopener', title: `Open ${serviceUrl(svc.port)} (needs the tunnel, unless the office runs on this computer)` }, 'Open ↗');
+      const title = direct ? `Open ${serviceUrl(svc.port)}` : `Open ${serviceUrl(svc.port)} (needs the tunnel, unless the office runs on this computer)`;
+      const open = h('a.btn', { href: serviceUrl(svc.port), target: '_blank', rel: 'noopener', title }, 'Open ↗');
       open.addEventListener('click', (e) => e.stopPropagation());
       const li = h(
         'li',
-        { class: on ? 'on' : '', tabindex: 0, role: 'button', title: 'Copy the tunnel command' },
+        { class: on ? 'on' : '', tabindex: 0, role: 'button', title: direct ? 'Copy the link' : 'Copy the tunnel command' },
         h('span.dot', { style: `background:${color}` }),
         h(
           'div.svc-main',
@@ -109,7 +116,13 @@ export function openServices() {
     body.append(list);
 
     const svc = s.items.find((i) => i.port === picked);
-    if (svc) {
+    if (svc && direct) {
+      body.append(
+        copied === svc.port
+          ? h('p.team-status.ok', {}, `✅ Copied ${serviceUrl(svc.port)}. Anyone on the network who's signed in to the office can open it.`)
+          : h('p.team-status', {}, `The link for :${svc.port}: ${serviceUrl(svc.port)}`),
+      );
+    } else if (svc) {
       const cmd = serviceTunnel(s, svc.port, os);
       body.append(
         copied === svc.port
@@ -120,9 +133,10 @@ export function openServices() {
     } else if (picked !== null) {
       body.append(h('p.team-status.error', {}, `The server on :${picked} stopped.`));
     }
+    if (direct) return;
     body.append(
       s.ssh
-        ? h('p.note', {}, 'It uses the same SSH access as the office. Not invited yourself (you set the office up)? Run ', h('code', {}, 'deploy/aws.sh service <port>'), ' instead.')
+        ? h('p.note', {}, 'It uses the same SSH access as the office. Not invited yourself (you set the office up)? Run ', h('code', {}, `${s.deploy ?? 'deploy/aws.sh'} service <port>`), ' instead.')
         : h('p.note', {}, 'Replace ', h('code', {}, 'you@your-server'), ' with how you SSH to the office\'s machine. If the office runs on this computer, just click Open.'),
     );
   };
@@ -131,6 +145,7 @@ export function openServices() {
   // Keeps "up 5m" fresh.
   const tick = setInterval(render, 30_000);
   const modal = openModal(el, {
+    doing: '🌐 at the services board',
     onClose: () => {
       unsubs.forEach((u) => u());
       clearInterval(tick);
