@@ -13,6 +13,9 @@ export const githubHandlers = {
   'gh.refresh'(ctx, c) {
     void ctx.floorOf(c)?.github.refresh();
   },
+  'gh.mine'(ctx, c, msg) {
+    ctx.floorOf(c)?.github.setMine(msg.on === true);
+  },
   'gh.merge'(ctx, c, msg) {
     const who = c.peer.name;
     const floor = here(ctx, c);

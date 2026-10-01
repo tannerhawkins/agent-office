@@ -130,8 +130,11 @@ export function openBoard(kind: 'issues' | 'pulls', net: Net, actions: BoardActi
   const body = h('div.body');
   const status = h('span.board-status');
   const refresh = h('button.btn', { title: 'Refresh from GitHub', onclick: () => net.send({ t: 'gh.refresh' }) }, '🔄 Refresh');
+  // The PR board can list only the pull requests the office's GitHub account authored: a big repository's whole board may be too much for GitHub to answer.
+  const mine = h('button.btn', { type: 'button', 'aria-pressed': 'false', title: "Only the pull requests the office's GitHub account authored. Saved for this floor, for everyone." }, '🙋 Only mine');
+  mine.addEventListener('click', () => net.send({ t: 'gh.mine', on: !store.pulls.mine }));
   const close = h('button.btn.close', { 'aria-label': 'Close' }, '✕');
-  const el = h('div.modal.board', { role: 'dialog', 'aria-label': kind === 'issues' ? 'Issues board' : 'Pull requests board' }, h('header', {}, h('h2', {}, kind === 'issues' ? '📌 Issues' : '🔀 Pull Requests'), status, refresh, close), body);
+  const el = h('div.modal.board', { role: 'dialog', 'aria-label': kind === 'issues' ? 'Issues board' : 'Pull requests board' }, h('header', {}, h('h2', {}, kind === 'issues' ? '📌 Issues' : '🔀 Pull Requests'), status, ...(kind === 'pulls' ? [mine] : []), refresh, close), body);
 
   const filters = loadFilters(kind);
   /** What each column's filter box holds (column key → text), for as long as the board is open. */
@@ -241,6 +244,8 @@ export function openBoard(kind: 'issues' | 'pulls', net: Net, actions: BoardActi
   const render = () => {
     const st = kind === 'issues' ? store.issues : store.pulls;
     status.textContent = st.loading ? 'Refreshing…' : st.fetchedAt ? `Updated ${timeAgo(st.fetchedAt)}` : '';
+    mine.setAttribute('aria-pressed', String(!!store.pulls.mine));
+    mine.classList.toggle('primary', !!store.pulls.mine);
     // Every refresh rebuilds the columns, so note how far each was scrolled and put it back afterwards,
     // and keep focus (and the caret, in a filter box) on the header, label toggle or box it was on.
     const scrolled = [...body.querySelectorAll('.column > ul')].map((ul) => ul.scrollTop);

@@ -50,6 +50,8 @@ export interface GhState<T> {
   error?: string;
   fetchedAt: number;
   loading: boolean;
+  /** The pull request board only lists the ones the office's GitHub account authored (see GitHub.setMine). */
+  mine?: boolean;
 }
 
 export type GhMergeMethod = 'squash' | 'merge' | 'rebase';
@@ -137,6 +139,8 @@ export const GH_LABEL_MAX = 100;
 
 export type GitHubClientMsg =
   | { t: 'gh.refresh' }
+  /** Show only the pull requests the office's GitHub account authored on this floor's PR board, or all of them again. */
+  | { t: 'gh.mine'; on: boolean }
   /** Merge a pull request; the answer comes back as gh.merged. */
   | { t: 'gh.merge'; number: number; method: GhMergeMethod; deleteBranch: boolean; auto?: boolean }
   /** Comment on an issue or a PR's conversation, as the server's gh account; answered with gh.commented. */

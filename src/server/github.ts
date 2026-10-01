@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import type { GhCheck, GhCloseReason, GhComment, GhIssue, GhIssueDetail, GhLabel, GhMergeMethod, GhPull, GhPullDetail, GhRepoInfo, GhReviewComment, GhState } from '../shared/protocol.js';
 import type { GhAs } from './signins.js';
 
@@ -59,6 +61,15 @@ function checkOf(c: any): GhCheck {
   return { name: c.workflowName ? `${c.workflowName} / ${name}` : name, state, url: c.detailsUrl ?? c.targetUrl ?? undefined };
 }
 
+/** Whether this floor's PR board was left on the pull requests its gh account authored. */
+function readMine(dir: string): boolean {
+  try {
+    return JSON.parse(readFileSync(path.join(dir, '.agent-office', 'github.json'), 'utf8')).mine === true;
+  } catch {
+    return false;
+  }
+}
+
 function commentsOf(raw: any[]): GhComment[] {
   return (raw ?? []).map((c: any) => ({
     id: String(c.id),
@@ -112,7 +123,27 @@ export class GitHub {
     private dir: string,
     private onIssues: (s: GhState<GhIssue>) => void,
     private onPulls: (s: GhState<GhPull>) => void,
-  ) {}
+  ) {
+    this.mine = readMine(dir);
+    this.pulls.mine = this.mine;
+  }
+
+  /** Only the pull requests the office's gh account authored: a big repository's whole board can be too much for GitHub to answer. */
+  private mine: boolean;
+
+  /** Narrows the PR board to the pull requests the office's gh account authored, or widens it again; saved with the floor. */
+  setMine(on: boolean) {
+    if (on === this.mine) return;
+    this.mine = on;
+    try {
+      writeFileSync(path.join(this.dir, '.agent-office', 'github.json'), JSON.stringify({ mine: on }), { mode: 0o600 });
+    } catch {
+      // not saved: it lasts until the office restarts
+    }
+    this.pulls = { items: [], fetchedAt: 0, loading: false, mine: on };
+    this.onPulls(this.pulls);
+    void this.refreshPulls();
+  }
 
   start() {
     void this.refresh();
@@ -399,11 +430,15 @@ export class GitHub {
     const asked = Date.now();
     try {
       const fields = 'number,title,state,isDraft,url,author,labels,reviewDecision,headRefName,headRefOid,baseRefName,createdAt,updatedAt,additions,deletions,statusCheckRollup,body,closingIssuesReferences';
+      const mine = this.mine;
+      const author = mine ? ['--author', '@me'] : [];
       const [open, merged, closed] = await Promise.all([
-        gh(['pr', 'list', '--state', 'open', '--limit', '150', '--json', fields], this.dir),
-        gh(['pr', 'list', '--state', 'merged', '--limit', '30', '--json', fields], this.dir),
-        gh(['pr', 'list', '--state', 'closed', '--limit', '40', '--json', fields], this.dir),
+        gh(['pr', 'list', '--state', 'open', '--limit', '150', ...author, '--json', fields], this.dir),
+        gh(['pr', 'list', '--state', 'merged', '--limit', '30', ...author, '--json', fields], this.dir),
+        gh(['pr', 'list', '--state', 'closed', '--limit', '40', ...author, '--json', fields], this.dir),
       ]);
+      // Switched while it was asking: this answer is for the other board.
+      if (mine !== this.mine) return void (this.pulls = { ...this.pulls, loading: false }, void this.refreshPulls());
       // `--state closed` includes merged PRs; keep only the ones closed without merging.
       const seen = new Set<number>();
       const all = [...JSON.parse(open), ...JSON.parse(merged), ...JSON.parse(closed)].filter((p: any) => !seen.has(p.number) && seen.add(p.number));
@@ -428,9 +463,9 @@ export class GitHub {
         closes: (p.closingIssuesReferences ?? []).map((r: any) => Number(r.number)).filter((n: number) => Number.isInteger(n) && n > 0),
       }));
       const items = this.relabel('pull', fetched, asked);
-      this.pulls = { items, fetchedAt: Date.now(), loading: false };
+      this.pulls = { items, fetchedAt: Date.now(), loading: false, mine: this.mine };
     } catch (err) {
-      this.pulls = { ...this.pulls, loading: false, error: (err as Error).message, fetchedAt: Date.now() };
+      this.pulls = { ...this.pulls, loading: false, error: (err as Error).message, fetchedAt: Date.now(), mine: this.mine };
     }
     this.onPulls(this.pulls);
   }
